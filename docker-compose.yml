@@ -1,0 +1,50 @@
+services:
+  # ───────────────────────────────────────────────────────────────────
+  # Node Alpha  (authority: node-alpha:8000, exposed on host :8001)
+  # ───────────────────────────────────────────────────────────────────
+  node-alpha:
+    build: ./node
+    ports:
+      - "8001:8000"
+    environment:
+      NODE_DOMAIN: "node-alpha:8000"
+      NODE_API_BASE: "http://node-alpha:8000"
+      DATABASE_URL: "sqlite+aiosqlite:////data/daid.db"
+      PRIVATE_KEY_FILE: "/data/node_key.bin"
+      API_KEY: "alpha-key"
+      FEDERATION_TIMEOUT: "10"
+      CACHE_TTL: "3600"
+    volumes:
+      - node_alpha_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ───────────────────────────────────────────────────────────────────
+  # Node Beta  (authority: node-beta:8000, exposed on host :8002)
+  # ───────────────────────────────────────────────────────────────────
+  node-beta:
+    build: ./node
+    ports:
+      - "8002:8000"
+    environment:
+      NODE_DOMAIN: "node-beta:8000"
+      NODE_API_BASE: "http://node-beta:8000"
+      DATABASE_URL: "sqlite+aiosqlite:////data/daid.db"
+      PRIVATE_KEY_FILE: "/data/node_key.bin"
+      API_KEY: "beta-key"
+      FEDERATION_TIMEOUT: "10"
+      CACHE_TTL: "3600"
+    volumes:
+      - node_beta_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  node_alpha_data:
+  node_beta_data:
