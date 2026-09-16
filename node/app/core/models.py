@@ -1,250 +1,311 @@
-"""
-Pydantic data models for the DAID protocol.
-"""
+"""Pydantic models for the DAID v3 wire protocol."""
 
-from datetime import datetime
-from typing import Any, Literal, Optional
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .guid import is_valid_daid
+from .guid import is_valid_daid, parse_daid
 
 
-# ---------------------------------------------------------------------------
-# Document Reference  (content-addressed pointer to an external document)
-# ---------------------------------------------------------------------------
+SCHEMA_VERSION = "3.0"
+PROOF_TYPE = "DaidJcsEd25519Signature2026"
+
+
+class RecordKind(str, Enum):
+    TYPE = "type"
+    INSTANCE = "instance"
+    ASSERTION = "assertion"
+    COLLECTION = "collection"
+
+
+class RelationshipRole(str, Enum):
+    MANUFACTURER = "manufacturer"
+    SUPPLIER = "supplier"
+    MAIN_CONTRACTOR = "main_contractor"
+    INSTALLER = "installer"
+    OWNER = "owner"
+    OPERATOR = "operator"
+    MAINTAINER = "maintainer"
+    INSPECTOR = "inspector"
+
+
+class RelationshipType(str, Enum):
+    DEFINES_TYPE = "defines_type"
+    CUSTODY_EVENT = "custody_event"
+    PROCURED_UNDER = "procured_under"
+    COMMISSIONED_BY = "commissioned_by"
+    CONTAINS_COMPONENT = "contains_component"
+    LOCATED_IN = "located_in"
+    MAINTAINED_BY = "maintained_by"
+    INSPECTED_BY = "inspected_by"
+    REPLACED_BY = "replaced_by"
+    SUPERSEDES = "supersedes"
+    DECOMMISSIONED_BY = "decommissioned_by"
+
+
+class RelationshipState(str, Enum):
+    PROPOSED = "proposed"
+    ACCEPTED = "accepted"
+    SUPERSEDED = "superseded"
+    REVOKED = "revoked"
+    DISPUTED = "disputed"
+
 
 class DocumentRef(BaseModel):
-    """
-    A pointer to an external document associated with this asset.
+    url: str | None = None
+    ipfs_cid: str | None = None
+    media_type: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    name: str | None = None
 
-    The sha256 hash allows any node or client to verify document integrity
-    independently of where the URL points. The authority can change CDN
-    providers without the hash changing.
-    """
 
-    type: str = Field(
-        ...,
-        description=(
-            "Document type — e.g. 'installation_manual', 'datasheet', "
-            "'ce_declaration', 'safety_data_sheet', 'drawing', 'firmware_image'"
-        ),
+class Site(BaseModel):
+    building: str | None = None
+    storey: str | None = None
+    space: str | None = None
+    ifc_guid: str | None = None
+
+
+class AssetSubject(BaseModel):
+    """A minimal signed projection with profile-specific extension claims."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str = Field(min_length=1)
+    manufacturer: str | None = None
+    model_number: str | None = None
+    serial_number: str | None = None
+    asset_owner: str | None = None
+    site: Site | None = None
+    documents: list[DocumentRef] = Field(default_factory=list)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class AvailabilityPolicy(BaseModel):
+    minimum_verified_replicas: int = Field(1, ge=1)
+    snapshot_every_version: bool = True
+    allow_content_networks: bool = True
+    visibility: Literal["public", "restricted"] = "public"
+    allowed_nodes: list[str] = Field(default_factory=list)
+
+
+class Proof(BaseModel):
+    type: Literal["DaidJcsEd25519Signature2026"] = PROOF_TYPE
+    verification_method: str = Field(min_length=1)
+    created: datetime
+    proof_purpose: str = "assertionMethod"
+    proof_value: str = Field(min_length=16)
+
+
+class TargetIntegrity(BaseModel):
+    mode: Literal["latest", "minimum_version", "snapshot"] = "latest"
+    version: int | None = Field(None, ge=1)
+    sha256: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_constraint(self) -> "TargetIntegrity":
+        if self.mode == "minimum_version" and self.version is None:
+            raise ValueError("minimum_version integrity requires version")
+        if self.mode == "snapshot" and (self.version is None or self.sha256 is None):
+            raise ValueError("snapshot integrity requires version and sha256")
+        return self
+
+
+class AssetRelationship(BaseModel):
+    relationship_id: str
+    source: str
+    target: str
+    role: RelationshipRole
+    relation_type: RelationshipType
+    asserted_by: str
+    accepted_by: str | None = None
+    asserted_at: datetime
+    effective_from: datetime | None = None
+    effective_to: datetime | None = None
+    state: RelationshipState = RelationshipState.PROPOSED
+    target_integrity: TargetIntegrity = Field(
+        default_factory=lambda: TargetIntegrity(mode="latest", version=None, sha256=None)
     )
-    url: str = Field(..., description="Public URL to fetch the document from")
-    sha256: Optional[str] = Field(
-        None,
-        description="Hex-encoded SHA-256 of the document bytes for integrity verification",
+    claims: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[DocumentRef] = Field(default_factory=list)
+    proofs: list[Proof] = Field(min_length=1)
+
+    @field_validator("source", "target")
+    @classmethod
+    def validate_daid(cls, value: str) -> str:
+        if not is_valid_daid(value):
+            raise ValueError(f"Invalid DAID URI: {value!r}")
+        return value
+
+
+class RelationshipProposalRequest(BaseModel):
+    source: str
+    target: str
+    role: RelationshipRole
+    relation_type: RelationshipType
+    target_integrity: TargetIntegrity = Field(
+        default_factory=lambda: TargetIntegrity(mode="latest", version=None, sha256=None)
     )
-    mime_type: Optional[str] = Field(None, description="MIME type, e.g. 'application/pdf'")
-    language: Optional[str] = Field(None, description="BCP-47 language tag, e.g. 'en'")
-    version: Optional[str] = Field(None, description="Document revision, e.g. '3.0'")
+    claims: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[DocumentRef] = Field(default_factory=list)
+    effective_from: datetime | None = None
+    effective_to: datetime | None = None
 
+    @field_validator("source", "target")
+    @classmethod
+    def validate_daid(cls, value: str) -> str:
+        return parse_daid(value).full_id
 
-# ---------------------------------------------------------------------------
-# IFC Property Sets  (ISO 16739 / buildingSMART)
-# ---------------------------------------------------------------------------
-
-class IFCPsets(BaseModel):
-    """
-    IFC 4.x property sets for BIM and facility management interoperability.
-
-    Keys are standard Pset names (e.g. 'Pset_ManufacturerTypeInformation').
-    Values are dicts of property name → value, matching IFC schema naming.
-
-    Common Psets:
-      Pset_ManufacturerTypeInformation — Manufacturer, ModelLabel, ProductionYear, GTIN
-      Pset_ServiceLife                 — ServiceLifeType, ServiceLifeDuration (ISO 8601 duration)
-      Pset_Warranty                    — WarrantyPeriod, WarrantyContent
-      Pset_MaintenanceStrategy         — MaintenanceStrategy
-    """
-
-    Pset_ManufacturerTypeInformation: Optional[dict[str, Any]] = None
-    Pset_ServiceLife: Optional[dict[str, Any]] = None
-    Pset_Warranty: Optional[dict[str, Any]] = None
-    Pset_MaintenanceStrategy: Optional[dict[str, Any]] = None
-    custom: Optional[dict[str, dict[str, Any]]] = Field(
-        None,
-        description="Custom Psets — key is the Pset name, value is a dict of properties",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Authority Data  (core product identity — issued and owned by authority node)
-# ---------------------------------------------------------------------------
-
-class AuthorityData(BaseModel):
-    """
-    The canonical product identity issued exclusively by the authority node.
-
-    This is the trust root of an asset record — only the authority node that
-    holds the signing key can create or modify these fields. Any peer node
-    may cache and serve this data, but the Ed25519 signature must always
-    verify against the authority's public key before the data is trusted.
-
-    Three optional extension layers:
-      ifc_psets  — ISO 16739 IFC property sets (BIM / facility management)
-      documents  — Content-addressed document pointers (manuals, certs, drawings)
-      schema_org — Supplemental schema.org fields not already mapped automatically
-    """
-
-    name: str = Field(..., description="Product or asset name")
-    manufacturer: str = Field(..., description="Manufacturer or brand name")
-    model_number: str = Field(..., description="Manufacturer's model or part number")
-    serial_number: Optional[str] = Field(
-        None, description="Individual unit serial number (leave null for product-level records)"
-    )
-    hardware_revision: Optional[str] = Field(
-        None, description="Hardware revision, e.g. 'Rev B'"
-    )
-    firmware_version: Optional[str] = Field(
-        None, description="Firmware or software version if applicable"
-    )
-
-    # IFC / BIM layer
-    ifc_psets: Optional[IFCPsets] = Field(
-        None, description="IFC 4.x property sets for BIM/CAFM interoperability"
-    )
-
-    # Document map
-    documents: list[DocumentRef] = Field(
-        default_factory=list,
-        description="Content-addressed pointers to manuals, certs, drawings, etc.",
-    )
-
-    # schema.org supplemental fields (auto-mapped fields like name/manufacturer
-    # are handled by the JSON-LD serialiser; add extras here)
-    schema_org: Optional[dict[str, Any]] = Field(
-        None,
-        description="Additional schema.org properties not automatically mapped",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Asset Metadata  (extended optional fields — hosted on authority, cached by peers)
-# ---------------------------------------------------------------------------
-
-class AssetMetadata(BaseModel):
-    """
-    Extended, optional metadata for an asset.
-
-    These fields supplement the core AuthorityData and are also part of the
-    signed record, meaning they can only be modified by the authority node.
-    Peer nodes cache this alongside the authority_data transparently.
-    """
-
-    description: Optional[str] = None
-    category: Optional[str] = None
-    sku: Optional[str] = Field(None, description="Stock Keeping Unit")
-    gtin: Optional[str] = Field(
-        None,
-        description="Global Trade Item Number (EAN-13, UPC-A, GTIN-14)",
-    )
-    origin_country: Optional[str] = Field(
-        None, description="ISO 3166-1 alpha-2 country code"
-    )
-    tags: list[str] = Field(default_factory=list)
-    attributes: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Open-ended key-value extensions. Prefix keys with a namespace, "
-                    "e.g. 'pharma:lot_number'.",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Asset Record (the canonical signed document)
-# ---------------------------------------------------------------------------
 
 class AssetRecord(BaseModel):
-    """
-    A complete, signed asset record as stored and exchanged between nodes.
-
-    `authority_data` holds the core product identity and is the primary field
-    peers cache when a record is resolved across the network.
-    `metadata` holds extended optional fields.
-    Both sections are covered by the Ed25519 `signature`.
-    """
-
-    id: str = Field(..., description="Full DAID URI, e.g. daid:acme.com:uuid4")
-    authority: str = Field(..., description="Authority domain of the issuing node")
-    authority_data: AuthorityData
-    metadata: AssetMetadata = Field(default_factory=AssetMetadata)
+    id: str
+    authority: str
+    controller: str
+    schema_version: Literal["3.0"] = SCHEMA_VERSION
+    record_kind: RecordKind
+    subject: AssetSubject
+    relationships: list[AssetRelationship] = Field(default_factory=list)
+    availability: AvailabilityPolicy = Field(
+        default_factory=lambda: AvailabilityPolicy(
+            minimum_verified_replicas=1,
+            snapshot_every_version=True,
+            allow_content_networks=True,
+        )
+    )
     created_at: datetime
     updated_at: datetime
     version: int = Field(1, ge=1)
-    signature: Optional[str] = Field(
-        None, description="Base64-encoded Ed25519 signature by the authority node"
-    )
+    proof: Proof
 
-    @field_validator("id")
-    @classmethod
-    def validate_daid(cls, v: str) -> str:
-        if not is_valid_daid(v):
-            raise ValueError(f"Invalid DAID URI: {v!r}")
-        return v
+    @model_validator(mode="after")
+    def validate_identity_and_edges(self) -> "AssetRecord":
+        parsed = parse_daid(self.id)
+        if parsed.authority_key_fingerprint != self.authority:
+            raise ValueError("Record authority does not match its DAID fingerprint")
+        if any(edge.source != self.id for edge in self.relationships):
+            raise ValueError("Every relationship source must equal the containing record id")
+        return self
 
-
-# ---------------------------------------------------------------------------
-# Asset History Entry (previous version snapshot)
-# ---------------------------------------------------------------------------
-
-class AssetHistoryEntry(BaseModel):
-    asset_id: str
-    version: int
-    authority_data: AuthorityData
-    metadata: AssetMetadata = Field(default_factory=AssetMetadata)
-    updated_at: datetime
-    signature: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Request bodies
-# ---------------------------------------------------------------------------
 
 class AssetCreateRequest(BaseModel):
-    authority_data: AuthorityData
-    metadata: AssetMetadata = Field(default_factory=AssetMetadata)
+    record_kind: RecordKind
+    subject: AssetSubject
+    controller: str | None = None
+    relationships: list[AssetRelationship] = Field(default_factory=list)
+    availability: AvailabilityPolicy = Field(
+        default_factory=lambda: AvailabilityPolicy(
+            minimum_verified_replicas=1,
+            snapshot_every_version=True,
+            allow_content_networks=True,
+        )
+    )
 
 
 class AssetUpdateRequest(BaseModel):
-    authority_data: AuthorityData
-    metadata: AssetMetadata = Field(default_factory=AssetMetadata)
+    subject: AssetSubject
+    controller: str | None = None
+    relationships: list[AssetRelationship] = Field(default_factory=list)
+    availability: AvailabilityPolicy = Field(
+        default_factory=lambda: AvailabilityPolicy(
+            minimum_verified_replicas=1,
+            snapshot_every_version=True,
+            allow_content_networks=True,
+        )
+    )
 
 
-# ---------------------------------------------------------------------------
-# Node Discovery / Info
-# ---------------------------------------------------------------------------
+class AssetHistoryEntry(BaseModel):
+    record: AssetRecord
+
+
+class VerificationMethod(BaseModel):
+    id: str
+    type: Literal["Ed25519VerificationKey2020"] = "Ed25519VerificationKey2020"
+    public_key_multibase: str
+    public_key_base64: str
+    purposes: list[str]
+    valid_from: datetime
+    valid_until: datetime | None = None
+    revoked_at: datetime | None = None
+
 
 class WellKnownResponse(BaseModel):
-    endpoint: str = Field(..., description="Base URL of this node's API")
-    node_id: str = Field(..., description="Authority domain of this node")
-    public_key: str = Field(..., description="Base64-encoded Ed25519 public key")
-    api_version: str = "1.0"
+    authority: str
+    genesis_public_key_multibase: str
+    protocol_version: Literal["3.0"] = SCHEMA_VERSION
+    endpoints: list[str]
+    mirrors: list[str] = Field(default_factory=list)
+    verification_methods: list[VerificationMethod]
+    sequence: int = Field(1, ge=1)
+    expires_at: datetime
+    proof: str
 
 
 class NodeInfo(BaseModel):
-    node_id: str
-    public_key: str
-    api_version: str = "1.0"
-    supported_features: list[str] = Field(default_factory=list)
+    routing_host: str
+    authority: str
+    protocol_version: Literal["3.0"] = SCHEMA_VERSION
+    supported_record_kinds: list[RecordKind] = Field(default_factory=lambda: list(RecordKind))
+    role: str
 
-
-# ---------------------------------------------------------------------------
-# Resolution response
-# ---------------------------------------------------------------------------
 
 class ResolveResponse(BaseModel):
-    asset: AssetRecord
+    record: AssetRecord
     verified: bool
-    source: str = Field(
-        ...,
-        description="One of: local_authoritative, local_cache, remote_authoritative",
-    )
-    authority_endpoint: Optional[str] = None
+    source: Literal["local_authoritative", "local_cache", "remote_authoritative"]
+    authority_endpoint: str | None = None
+    trust_state: Literal["verified_current", "verified_stale"] = "verified_current"
+    verified_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-# ---------------------------------------------------------------------------
-# Paginated list response
-# ---------------------------------------------------------------------------
+class ResolveGraphRequest(BaseModel):
+    root: str
+    depth: int = Field(2, ge=0, le=5)
+    max_nodes: int = Field(50, ge=1, le=100)
+    view: Literal["public", "partner", "confidential"] = "public"
+
+    @field_validator("root")
+    @classmethod
+    def validate_root(cls, value: str) -> str:
+        return parse_daid(value).full_id
+
+
+class GraphNode(BaseModel):
+    status: Literal["verified_current", "verified_stale", "snapshot_verified"]
+    record: AssetRecord
+    source: str
+    verified_at: datetime
+
+
+class GraphFailure(BaseModel):
+    daid: str
+    status: Literal[
+        "restricted", "not_found", "unavailable", "invalid_signature",
+        "authority_mismatch", "unsupported_schema", "revoked",
+    ]
+    reason_code: str
+    last_verified_at: datetime | None = None
+    retryable: bool = False
+
+
+class GraphLimits(BaseModel):
+    requested_depth: int
+    reached_depth: int
+    max_nodes: int
+    truncated: bool
+
+
+class ResolveGraphResponse(BaseModel):
+    root: str
+    complete: bool
+    nodes: dict[str, GraphNode]
+    edges: list[AssetRelationship]
+    failures: list[GraphFailure]
+    limits: GraphLimits
+    resolved_at: datetime
+
 
 class AssetListResponse(BaseModel):
     items: list[AssetRecord]
@@ -253,39 +314,24 @@ class AssetListResponse(BaseModel):
     offset: int
 
 
-# ---------------------------------------------------------------------------
-# Gossip protocol models
-# ---------------------------------------------------------------------------
-
 class GossipPeerState(BaseModel):
-    """The view one node has of a peer's health and identity."""
-
-    node_id: str = Field(..., description="Authority domain of the peer node")
-    endpoint: str = Field(..., description="Base HTTP URL of the peer node")
-    public_key: Optional[str] = Field(None, description="Base64 Ed25519 public key")
+    node_id: str
+    endpoint: str
+    public_key: str | None = None
     status: Literal["alive", "suspect", "dead"] = "alive"
-    last_seen: Optional[datetime] = None
-    generation: int = Field(0, description="Monotonically increasing heartbeat counter")
+    last_seen: datetime | None = None
+    generation: int = 0
 
 
 class GossipDigest(BaseModel):
-    """
-    A compact summary of what one node knows about the network.
-    Sent during gossip exchange so peers can identify stale/missing entries.
-    """
-
     from_node: str
     peers: list[GossipPeerState] = Field(default_factory=list)
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(tz=__import__('datetime').timezone.utc))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class GossipSyncRequest(BaseModel):
-    """Payload for POST /v1/gossip/sync"""
-
     digest: GossipDigest
 
 
 class GossipSyncResponse(BaseModel):
-    """Response — the receiver's own digest so the caller can update their state."""
-
     digest: GossipDigest

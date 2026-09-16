@@ -1,241 +1,204 @@
-# DAID — Distributed Asset Identification
+# DAID - Distributed Asset Identification
 
-A federated, encrypted, node-based product and asset tracking protocol.  
-Each asset is assigned a globally unique, routable identifier. Any node on the
-network can resolve that identifier to a cryptographically-verified record by
-routing the request to the authoritative node — without a central registry.
+DAID 3.0 is a federated protocol for identifying physical assets and resolving
+their independently governed lifecycle evidence. Each record is signed by its
+issuer, each identifier binds to an authority key fingerprint, and an owner-held
+instance record links manufacturer, supplier, contractor, inspector, and other
+stakeholder assertions without copying their source data into one database.
 
-Conceptually similar to the [Matrix protocol](https://matrix.org/) for
-messaging or [ActivityPub](https://activitypub.rocks/) for social media, but
-purpose-built for **supply-chain asset databasing**.
+This repository is a presentation-ready research implementation. It demonstrates
+the protocol and failure model; it is not yet a production trust service. See
+[the roadmap](docs/roadmap.md) for the remaining security and operational work.
 
----
+## What Is Implemented
 
-## Core Concepts
+- Self-certifying identifiers: `daid://{routing-host}/{key-fingerprint}/{uuid4}`
+- RFC 8785 JSON canonicalization and Ed25519 structured proofs
+- Signed `3.0` authority descriptors and purpose-scoped verification methods
+- `type`, `instance`, `assertion`, and `collection` records
+- Stakeholder-signed relationship proposals and owner-signed acceptance
+- Exact manufacturer baseline snapshots for `defines_type` relationships
+- Bounded, cycle-safe graph resolution with verified cache fallback
+- Signed public/restricted visibility and explicit per-node replication grants
+- Six role-based demo services, gossip membership, Python SDK, and web console
 
-| Concept | Description |
-|---|---|
-| **DAID URI** | `daid:{authority}:{uuid4}` — globally unique, self-routing |
-| **Authority Node** | The server responsible for issuing and owning a record |
-| **Federation** | Any node can cache/mirror records; authority node is source of truth |
-| **Cryptographic Signing** | Every record is signed with the authority node's Ed25519 key |
-| **Discovery** | Nodes are found via `/.well-known/daid/server` on the authority domain |
-
-### Example DAID URI
-
-```
-daid:products.acme.com:550e8400-e29b-41d4-a716-446655440000
-      └───────────────┘ └──────────────────────────────────┘
-         Authority            UUID v4 (unique asset ID)
-```
-
-To resolve this asset, any client or peer node:
-1. Parses the authority: `products.acme.com`
-2. Fetches `https://products.acme.com/.well-known/daid/server` → gets the API endpoint + public key
-3. Fetches the record from the authority node's API
-4. Verifies the Ed25519 signature using the public key
-5. Trusts nothing without a valid signature
-
----
-
-## Architecture at a Glance
-
-```
-   CLIENT                    PEER NODE B                  AUTHORITY NODE A
-     │                           │                              │
-     │  resolve(daid:nodeA.com:uuid)                           │
-     │──────────────────────────>│                              │
-     │                           │  GET /.well-known/daid/server│
-     │                           │─────────────────────────────>│
-     │                           │<─── {endpoint, public_key} ──│
-     │                           │  GET /v1/assets/nodeA.com/uuid
-     │                           │─────────────────────────────>│
-     │                           │<───── signed AssetRecord ────│
-     │                           │  verify_sig(record, pubkey)  │
-     │<──── verified record ─────│                              │
-```
-
----
+The normative wire and resolution rules are in the
+[DAID Instance-Based Dependency Network](docs/instance-dependency-network.md).
+The implementation view and governance diagrams are in
+[Architecture](docs/architecture.md).
 
 ## Quick Start
 
-### Prerequisites
-- Python 3.11+
-- Docker (optional, for multi-node development)
+Prerequisites:
 
-### Run a single node
+- Windows PowerShell 7
+- Python 3.11 or later
 
-```bash
-cd node
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-
-# Copy and edit the environment file
-cp ../.env.example .env
-
-# Start the node
-uvicorn app.main:app --reload --port 8000
+.\examples\run-network.ps1
 ```
 
-The node will auto-generate an Ed25519 keypair on first run and save it to the
-path configured in `PRIVATE_KEY_FILE`.
+The script starts and seeds six services:
 
-### Run two federated nodes (Docker)
+| Port | Authority role | Demonstrated responsibility |
+|---:|---|---|
+| 8101 | Manufacturer | Product type and accepted baseline |
+| 8102 | Supplier | Delivery and custody assertion |
+| 8103 | Main contractor | Procurement assertion |
+| 8104 | Owner | Physical instance root and acceptance decisions |
+| 8105 | Inspector | Commissioning inspection assertion |
+| 8106 | Relay | Independent federated graph resolution and cache |
 
-```bash
-docker compose up --build
-# Node Alpha → http://localhost:8001
-# Node Beta  → http://localhost:8002
+Open the operations console at <http://127.0.0.1:8104/ui>. Verify the complete
+federated graph independently through the relay:
+
+```powershell
+.\examples\verify-network.ps1
 ```
 
-### Register an asset
+The seeded manufacturer type is public. The installed instance, delivery,
+procurement, and inspection records are restricted to the Owner (`8104`) and
+Relay client (`8106`). The verification script also proves that the Contractor
+node cannot enumerate the Owner instance or Inspector assertion.
 
-```bash
-curl -X POST http://localhost:8000/v1/assets \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: your-api-key" \
-  -d '{
-    "metadata": {
-      "name": "Widget Pro 3000",
-      "category": "electronics",
-      "manufacturer": "Acme Corp",
-      "sku": "WP-3000",
-      "gtin": "00012345678905"
-    }
-  }'
-```
+### Data Visibility
 
-Response:
+Visibility is part of the signed record envelope:
+
 ```json
 {
-  "id": "daid:localhost:8000:550e8400-e29b-41d4-a716-446655440000",
-  "authority": "localhost:8000",
-  "metadata": { "name": "Widget Pro 3000", ... },
-  "created_at": "2026-03-31T12:00:00+00:00",
-  "updated_at": "2026-03-31T12:00:00+00:00",
-  "version": 1,
-  "signature": "base64-encoded-ed25519-signature"
+  "availability": {
+    "visibility": "restricted",
+    "allowed_nodes": ["127.0.0.1:8104", "127.0.0.1:8106"]
+  }
 }
 ```
 
-### Resolve an asset (from any node)
+- `public` records may be fetched anonymously and replicated across live peers.
+- `restricted` records are replicated only to the exact routing hosts in
+  `allowed_nodes` and require that receiving node's API key for catalog, direct,
+  graph, and document reads.
+- Catalogs default to records authoritative on that node. `scope=network`
+  exposes the node's permitted cache only to its authenticated local operator.
+- `public` graph requests never disclose a restricted root. `partner` and
+  `confidential` views require the local node API key.
 
-```bash
-# Any node can resolve any DAID — it routes automatically
-curl "http://localhost:8002/v1/resolve/localhost:8000/550e8400-e29b-41d4-a716-446655440000"
+The web console does not contain API keys. Keys entered through **Private
+access** or write dialogs are retained only in browser session storage. The
+example keys in the PowerShell scripts are demo credentials and must not be
+used for a production deployment.
+
+This policy provides API authorization and minimizes distribution. It does not
+encrypt SQLite databases or document files at rest; production deployments
+still require encrypted storage, secret management, authenticated service
+identity, key rotation, and transport-layer access controls.
+
+To retain demo keys and databases between starts:
+
+```powershell
+.\examples\run-network.ps1 -KeepData
 ```
 
-### Python client SDK
+## Docker Demo
 
-```python
-import asyncio
-from client.daid_client import DAIDClient
-
-async def main():
-    client = DAIDClient("http://localhost:8000", api_key="your-api-key")
-
-    # Create an asset
-    asset = await client.create_asset({
-        "name": "Widget Pro 3000",
-        "manufacturer": "Acme Corp",
-        "sku": "WP-3000"
-    })
-    print(f"Created: {asset.id}")
-
-    # Resolve from any node (routes automatically, verifies signature)
-    result = await client.resolve(asset.id)
-    print(f"Verified: {result.verified}, Source: {result.source}")
-
-asyncio.run(main())
+```powershell
+docker compose -f docker-compose.demo-6node.yml up --build -d
+.\examples\seed-network.ps1
+.\examples\verify-network.ps1
 ```
 
----
+The Docker network uses service names as routing hosts. Browser traffic enters
+through the published ports; authorities resolve one another inside the Compose
+network. The demo explicitly enables HTTP discovery for those private service
+names; production deployments keep `ALLOW_INSECURE_HTTP_DISCOVERY=false` and use
+HTTPS authority endpoints.
 
-## Project Structure
+## Single Node
 
-```
-├── README.md
-├── docs/
-│   ├── architecture.md          # Deep-dive architecture
-│   └── protocol-spec.md         # Protocol specification
-├── node/                        # Node server (Python / FastAPI)
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── app/
-│       ├── main.py              # FastAPI entry point
-│       ├── config.py            # Settings (env-driven)
-│       ├── dependencies.py      # FastAPI dependency injection
-│       ├── core/
-│       │   ├── guid.py          # DAID parsing and generation
-│       │   ├── crypto.py        # Ed25519 signing and verification
-│       │   └── models.py        # Pydantic data models
-│       ├── db/
-│       │   ├── database.py      # Async SQLAlchemy setup
-│       │   └── orm_models.py    # ORM table definitions
-│       ├── api/
-│       │   ├── assets.py        # Asset CRUD endpoints
-│       │   ├── federation.py    # Node-to-node sync endpoint
-│       │   ├── discovery.py     # /.well-known/daid/server
-│       │   └── node_info.py     # Node metadata endpoint
-│       └── federation/
-│           ├── client.py        # Push records to peer nodes
-│           └── resolver.py      # Resolve DAIDs from remote nodes
-├── client/
-│   └── daid_client.py           # Python SDK
-├── examples/
-│   └── demo.py                  # Full workflow demonstration
-├── docker-compose.yml
-└── .env.example
+```powershell
+$env:NODE_DOMAIN = "localhost:8000"
+$env:NODE_API_BASE = "http://localhost:8000"
+$env:API_KEY = "demo-key"
+$env:DID_WEB_ID = "did:web:localhost%3A8000"
+.\.venv\Scripts\uvicorn.exe node.app.main:app --port 8000
 ```
 
----
+- Operations console: <http://localhost:8000/ui>
+- OpenAPI: <http://localhost:8000/docs>
+- Signed descriptor: <http://localhost:8000/.well-known/daid/server>
 
-## API Reference
+Publish a manufacturer type:
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| `GET` | `/v1/assets` | — | List assets on this node |
-| `GET` | `/v1/assets/{authority}/{uuid}` | — | Get a specific asset (local) |
-| `POST` | `/v1/assets` | API Key | Register a new asset |
-| `PUT` | `/v1/assets/{authority}/{uuid}` | API Key | Update asset metadata |
-| `GET` | `/v1/assets/{authority}/{uuid}/history` | — | Version history |
-| `GET` | `/v1/resolve/{authority}/{uuid}` | — | Resolve from network (routed) |
-| `POST` | `/v1/federation/sync` | — | Receive a synced record from a peer |
-| `GET` | `/v1/node/info` | — | Node public key and capabilities |
-| `GET` | `/.well-known/daid/server` | — | Node discovery document |
+```powershell
+$body = @{
+  record_kind = "type"
+  subject = @{
+    name = "Fire Door FD60"
+    manufacturer = "Example Manufacturing"
+    model_number = "FD60-01"
+  }
+} | ConvertTo-Json -Depth 8
 
----
+Invoke-RestMethod -Method Post -Uri "http://localhost:8000/v3/records" `
+  -Headers @{ "x-api-key" = "demo-key" } `
+  -ContentType "application/json" -Body $body
+```
 
-## Security Model
+Resolve a graph:
 
-- **Signatures**: Every record is signed with the authority node's Ed25519 private key. Clients and peer nodes verify before trusting.
-- **Authority enforcement**: Only the node whose domain matches the DAID authority can issue or update a record.
-- **Transport**: All production traffic must use TLS (HTTPS). The `.well-known` lookup enforces HTTPS first.
-- **API Keys**: Write operations require an API key (header `x-api-key`). Rotate this regularly; replace with JWT/mTLS for production.
-- **No blind trust of caches**: Cached records on peer nodes are always verified against the authority node's public key before being stored.
+```powershell
+$request = @{ root = "daid://..."; depth = 2; max_nodes = 50 } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://localhost:8000/v3/resolve-graph" `
+  -ContentType "application/json" -Body $request
+```
 
----
+## API Surface
 
-## Comparison with Matrix Protocol
-
-| Feature | Matrix | DAID |
+| Method | Path | Purpose |
 |---|---|---|
-| Federation model | Federated homeservers | Federated authority nodes |
-| Global ID format | `@user:server.com` | `daid:node.com:uuid4` |
-| Discovery | DNS + `.well-known` | DNS + `.well-known/daid/server` |
-| Data type | Messages/rooms | Asset/product records |
-| Cryptographic proofs | Room state signatures | Ed25519 record signatures |
-| Authority | Room creator's server | Record-issuing node |
-| Caching | Server-side sync | Peer node caching with sig verify |
+| `GET` | `/.well-known/daid/server` | Signed authority descriptor |
+| `GET` | `/v3/node/info` | Node role and authority identity |
+| `GET` | `/v3/node/access` | Validate local private-data access |
+| `GET` | `/v3/records` | List locally held records |
+| `POST` | `/v3/records` | Publish an authoritative record |
+| `GET` | `/v3/records/{authority}/{uuid}` | Fetch a local record |
+| `PUT` | `/v3/records/{authority}/{uuid}` | Append a signed record version |
+| `GET` | `/v3/records/{authority}/{uuid}/history` | Read immutable prior versions |
+| `POST` | `/v3/relationships/proposals` | Stakeholder-sign a relationship |
+| `POST` | `/v3/relationships/accept` | Verify and owner-accept a proposal |
+| `POST` | `/v3/resolve-graph` | Resolve a bounded verified graph |
+| `POST` | `/v3/federation/sync` | Replicate a verified signed record |
+| `POST` | `/v3/documents/upload/{authority}/{uuid}` | Attach and distribute a document |
+| `GET` | `/v3/documents/{sha256}` | Read an authorized document replica |
+| `GET` | `/v3/gossip/peers` | Inspect peer membership |
 
----
+Writes require the node's `x-api-key`. Proof verification never treats that API
+key as an identity credential; authority derives from Ed25519 keys and signed
+descriptors.
 
-## Roadmap
+## Test
 
-- [ ] DHT-based discovery (no DNS dependency)
-- [ ] Verifiable Credentials (W3C VC) export format
-- [ ] DID method (`did:daid:...`) for W3C compatibility
-- [ ] Webhook/event subscriptions for record changes
-- [ ] Asset lineage graph (tracks components → assemblies)
-- [ ] Recall/revocation mechanism with propagation
-- [ ] Web UI for node management
-- [ ] gRPC transport option for high-throughput federation
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+The regression test creates a fresh node, publishes a record, validates its
+proof against discovery, retrieves it, resolves its graph, and verifies clean
+database shutdown.
+
+## Repository Layout
+
+```text
+client/                 Python SDK
+docs/                   Protocol, architecture, and roadmap
+examples/               Six-service launch, seed, and verification scripts
+node/app/api/            HTTP routes
+node/app/core/           Identifiers, models, canonicalization, and signing
+node/app/db/             Persistence
+node/app/federation/     Discovery, remote verification, and gossip
+node/app/static/         Operations console
+tests/                   Executable regression tests
+```

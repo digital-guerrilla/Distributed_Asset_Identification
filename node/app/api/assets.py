@@ -1,117 +1,126 @@
-"""
-Asset CRUD endpoints — serves records held by this node.
+"""Authoritative DAID v3 record publication and history endpoints."""
 
-Routes:
-  GET  /v1/assets                        - List assets on this node (paginated)
-  GET  /v1/assets/{authority}/{uuid}     - Get a specific asset (local store)
-  POST /v1/assets                        - Register a new asset (write-protected)
-  PUT  /v1/assets/{authority}/{uuid}     - Update asset metadata (write-protected)
-  GET  /v1/assets/{authority}/{uuid}/history  - Version history
-"""
-
+import asyncio
+import json
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
 from ..core.crypto import NodeKeyManager
-from ..core.guid import generate_daid
+from ..core.guid import generate_daid, parse_daid
 from ..core.models import (
     AssetCreateRequest,
     AssetHistoryEntry,
     AssetListResponse,
-    AssetMetadata,
     AssetRecord,
+    AssetRelationship,
+    AssetSubject,
     AssetUpdateRequest,
-    AuthorityData,
+    AvailabilityPolicy,
+    Proof,
 )
 from ..db.database import get_db
 from ..db.orm_models import Asset, AssetHistory
-from ..dependencies import get_key_manager, require_api_key
+from ..dependencies import get_key_manager, require_api_key, valid_api_key
 
-router = APIRouter(prefix="/v1/assets", tags=["assets"])
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _orm_to_record(asset: Asset) -> AssetRecord:
-    """Convert an ORM Asset row to a Pydantic AssetRecord."""
-    return AssetRecord(
-        id=asset.id,
-        authority=asset.authority,
-        authority_data=AuthorityData(**(asset.authority_data_json or {})),
-        metadata=AssetMetadata(**(asset.metadata_json or {})),
-        created_at=_utc(asset.created_at),
-        updated_at=_utc(asset.updated_at),
-        version=asset.version,
-        signature=asset.signature,
-    )
+router = APIRouter(prefix="/v3/records", tags=["records"])
 
 
-def _record_signing_dict(asset: Asset, now_iso: str | None = None) -> dict:
-    """Build the dict that gets signed (excludes the 'signature' key)."""
-    return {
-        "id": asset.id,
-        "authority": asset.authority,
-        "authority_data": asset.authority_data_json or {},
-        "metadata": asset.metadata_json or {},
-        "created_at": _utc(asset.created_at).isoformat(),
-        "updated_at": now_iso or _utc(asset.updated_at).isoformat(),
-        "version": asset.version,
+def orm_to_record(asset: Asset) -> AssetRecord:
+    return AssetRecord.model_validate(asset.record_json)
+
+
+def record_to_storage(record: AssetRecord) -> tuple[dict, str]:
+    document = record.model_dump(mode="json")
+    return document, json.dumps(document, separators=(",", ":"), ensure_ascii=True)
+
+
+def _controller() -> str:
+    return settings.DID_WEB_ID or f"did:web:{settings.NODE_DOMAIN.replace(':', '%3A')}"
+
+
+def _signed_record(
+    *,
+    record_id: str,
+    record_kind: str,
+    subject: AssetSubject,
+    relationships: list[AssetRelationship],
+    availability: AvailabilityPolicy,
+    controller: str,
+    created_at: datetime,
+    updated_at: datetime,
+    version: int,
+    key_manager: NodeKeyManager,
+) -> AssetRecord:
+    proof_created = updated_at
+    document = {
+        "id": record_id,
+        "authority": key_manager.public_key_multibase,
+        "controller": controller,
+        "schema_version": "3.0",
+        "record_kind": record_kind,
+        "subject": subject.model_dump(mode="json"),
+        "relationships": [item.model_dump(mode="json") for item in relationships],
+        "availability": availability.model_dump(mode="json"),
+        "created_at": created_at.isoformat(),
+        "updated_at": updated_at.isoformat(),
+        "version": version,
+        "proof": Proof(
+            verification_method=f"{controller}#daid-record-signing",
+            created=proof_created,
+            proof_value="unsigned-placeholder",
+        ).model_dump(mode="json"),
     }
+    normalized = AssetRecord.model_validate(document)
+    signature = key_manager.sign_record(normalized.model_dump(mode="json"))
+    document = normalized.model_dump(mode="json")
+    document["proof"]["proof_value"] = signature
+    return AssetRecord.model_validate(document)
 
-
-def _utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-# ---------------------------------------------------------------------------
-# GET /v1/assets  — list
-# ---------------------------------------------------------------------------
 
 @router.get("", response_model=AssetListResponse)
 async def list_assets(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    scope: str = Query("authority", pattern="^(authority|network)$"),
+    x_api_key: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> AssetListResponse:
-    count_result = await db.execute(select(func.count(Asset.id)))
-    total = count_result.scalar_one()
-
-    result = await db.execute(
-        select(Asset).order_by(Asset.created_at.desc()).limit(limit).offset(offset)
+    rows = await db.execute(select(Asset).order_by(Asset.created_at.desc()))
+    authenticated = valid_api_key(x_api_key)
+    visible = [
+        row for row in rows.scalars()
+        if (scope == "network" or row.is_authoritative)
+        and (orm_to_record(row).availability.visibility == "public" or authenticated)
+    ]
+    return AssetListResponse(
+        items=[orm_to_record(row) for row in visible[offset:offset + limit]],
+        total=len(visible),
+        limit=limit,
+        offset=offset,
     )
-    items = [_orm_to_record(a) for a in result.scalars()]
-    return AssetListResponse(items=items, total=total, limit=limit, offset=offset)
 
 
-# ---------------------------------------------------------------------------
-# GET /v1/assets/{authority}/{uuid}  — single asset
-# ---------------------------------------------------------------------------
-
-@router.get("/{authority}/{uuid}", response_model=AssetRecord)
+@router.get("/{authority}/{record_uuid}", response_model=AssetRecord)
 async def get_asset(
     authority: str,
-    uuid: str,
+    record_uuid: str,
+    x_api_key: str | None = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ) -> AssetRecord:
-    daid = f"daid:{authority}:{uuid}"
-    result = await db.execute(select(Asset).where(Asset.id == daid))
-    asset = result.scalar_one_or_none()
-    if asset is None:
-        raise HTTPException(status_code=404, detail=f"Asset not found: {daid}")
-    return _orm_to_record(asset)
+    record_id = f"daid://{settings.NODE_DOMAIN}/{authority}/{record_uuid}"
+    row = (await db.execute(select(Asset).where(Asset.id == record_id))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Record not found: {record_id}")
+    record = orm_to_record(row)
+    if record.availability.visibility == "restricted" and not valid_api_key(x_api_key):
+        raise HTTPException(status_code=403, detail="Record access is restricted")
+    return record
 
-
-# ---------------------------------------------------------------------------
-# POST /v1/assets  — create
-# ---------------------------------------------------------------------------
 
 @router.post("", response_model=AssetRecord, status_code=201)
 async def create_asset(
@@ -120,164 +129,175 @@ async def create_asset(
     key_manager: NodeKeyManager = Depends(get_key_manager),
     _: None = Depends(require_api_key),
 ) -> AssetRecord:
-    daid = generate_daid(settings.NODE_DOMAIN)
+    record_id = generate_daid(settings.NODE_DOMAIN, key_manager.public_key_multibase)
+    if body.relationships:
+        raise HTTPException(
+            status_code=422,
+            detail="Create the record first, then add relationships with PUT so their source can equal its DAID",
+        )
     now = datetime.now(timezone.utc)
-    authority_data_dict = body.authority_data.model_dump()
-    metadata_dict = body.metadata.model_dump()
-
-    signing_dict = {
-        "id": daid,
-        "authority": settings.NODE_DOMAIN,
-        "authority_data": authority_data_dict,
-        "metadata": metadata_dict,
-        "created_at": now.isoformat(),
-        "updated_at": now.isoformat(),
-        "version": 1,
-    }
-    signature = key_manager.sign_record(signing_dict)
-
-    asset = Asset(
-        id=daid,
-        authority=settings.NODE_DOMAIN,
-        authority_data_json=authority_data_dict,
-        metadata_json=metadata_dict,
+    record = _signed_record(
+        record_id=record_id,
+        record_kind=body.record_kind.value,
+        subject=body.subject,
+        relationships=[],
+        availability=body.availability,
+        controller=body.controller or _controller(),
         created_at=now,
         updated_at=now,
         version=1,
-        signature=signature,
-        is_authoritative=True,
+        key_manager=key_manager,
     )
-    db.add(asset)
+    document, raw_payload = record_to_storage(record)
+    parsed = parse_daid(record.id)
+    db.add(Asset(
+        id=record.id,
+        routing_host=parsed.routing_host,
+        authority=record.authority,
+        controller=record.controller,
+        record_kind=record.record_kind.value,
+        record_json=document,
+        raw_payload=raw_payload,
+        created_at=now,
+        updated_at=now,
+        version=1,
+        is_authoritative=True,
+        verified_at=now,
+    ))
     await db.commit()
-    await db.refresh(asset)
-    return _orm_to_record(asset)
+    asyncio.create_task(_push_to_peers(record))
+    return record
 
 
-# ---------------------------------------------------------------------------
-# PUT /v1/assets/{authority}/{uuid}  — update
-# ---------------------------------------------------------------------------
-
-@router.put("/{authority}/{uuid}", response_model=AssetRecord)
+@router.put("/{authority}/{record_uuid}", response_model=AssetRecord)
 async def update_asset(
     authority: str,
-    uuid: str,
+    record_uuid: str,
     body: AssetUpdateRequest,
     db: AsyncSession = Depends(get_db),
     key_manager: NodeKeyManager = Depends(get_key_manager),
     _: None = Depends(require_api_key),
 ) -> AssetRecord:
-    daid = f"daid:{authority}:{uuid}"
-    result = await db.execute(select(Asset).where(Asset.id == daid))
-    asset = result.scalar_one_or_none()
+    record_id = f"daid://{settings.NODE_DOMAIN}/{authority}/{record_uuid}"
+    row = (await db.execute(select(Asset).where(Asset.id == record_id))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Record not found: {record_id}")
+    if not row.is_authoritative or authority != key_manager.public_key_multibase:
+        raise HTTPException(status_code=403, detail="This node is not authoritative for the record")
 
-    if asset is None:
-        raise HTTPException(status_code=404, detail=f"Asset not found: {daid}")
-    if not asset.is_authoritative:
+    previous = orm_to_record(row)
+    if body.relationships != previous.relationships:
         raise HTTPException(
-            status_code=403,
-            detail="This node is not authoritative for the requested asset",
+            status_code=422,
+            detail="Relationships can only be changed through the signed proposal workflow",
         )
-
-    # Snapshot the current version to history before mutating
-    history = AssetHistory(
-        asset_id=asset.id,
-        version=asset.version,
-        authority_data_json=asset.authority_data_json,
-        metadata_json=asset.metadata_json,
-        updated_at=_utc(asset.updated_at),
-        signature=asset.signature,
+    return await replace_asset_subject(
+        row=row,
+        subject=body.subject,
+        controller=body.controller or previous.controller,
+        availability=body.availability,
+        db=db,
+        key_manager=key_manager,
     )
-    db.add(history)
 
-    # Apply update
+
+async def replace_asset_subject(
+    *,
+    row: Asset,
+    subject: AssetSubject,
+    controller: str,
+    availability: AvailabilityPolicy | None = None,
+    db: AsyncSession,
+    key_manager: NodeKeyManager,
+) -> AssetRecord:
+    """Create, persist, and federate the next signed version of an authoritative record."""
+    previous = orm_to_record(row)
+    db.add(AssetHistory(
+        asset_id=row.id,
+        version=row.version,
+        record_json=row.record_json,
+        raw_payload=row.raw_payload,
+        updated_at=row.updated_at,
+    ))
     now = datetime.now(timezone.utc)
-    new_version = asset.version + 1
-    new_authority_data = body.authority_data.model_dump()
-    new_metadata = body.metadata.model_dump()
-
-    signing_dict = {
-        "id": asset.id,
-        "authority": asset.authority,
-        "authority_data": new_authority_data,
-        "metadata": new_metadata,
-        "created_at": _utc(asset.created_at).isoformat(),
-        "updated_at": now.isoformat(),
-        "version": new_version,
-    }
-    new_signature = key_manager.sign_record(signing_dict)
-
-    asset.authority_data_json = new_authority_data
-    asset.metadata_json = new_metadata
-    asset.updated_at = now
-    asset.version = new_version
-    asset.signature = new_signature
-
+    record = _signed_record(
+        record_id=row.id,
+        record_kind=previous.record_kind.value,
+        subject=subject,
+        relationships=previous.relationships,
+        availability=availability or previous.availability,
+        controller=controller,
+        created_at=_utc(row.created_at),
+        updated_at=now,
+        version=row.version + 1,
+        key_manager=key_manager,
+    )
+    row.record_json, row.raw_payload = record_to_storage(record)
+    row.controller = record.controller
+    row.updated_at = now
+    row.version = record.version
+    row.verified_at = now
     await db.commit()
-    await db.refresh(asset)
-    record = _orm_to_record(asset)
-
-    # Fan-out the updated record to all known peers so their caches update immediately
-    import asyncio as _asyncio
-    _asyncio.create_task(_push_to_peers(record))
-
+    asyncio.create_task(_push_to_peers(record))
     return record
 
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Peer push helper (fire-and-forget after update)
-# ---------------------------------------------------------------------------
-
-async def _push_to_peers(record: AssetRecord) -> None:
-    """Push updated record to all alive gossip peers in the background."""
-    try:
-        import httpx as _httpx
-        from ..federation.gossip import get_all_peers
-        peers = await get_all_peers()
-        alive = [p for p in peers if p.status == "alive"]
-        payload = record.model_dump(mode="json")
-        async with _httpx.AsyncClient(timeout=5) as client:
-            for peer in alive:
-                try:
-                    await client.post(
-                        f"{peer.endpoint.rstrip('/')}/v1/federation/sync",
-                        json=payload,
-                    )
-                except Exception:
-                    pass  # best-effort; peer may be temporarily unreachable
-    except Exception:
-        pass
-
-
-# GET /v1/assets/{authority}/{uuid}/history  — version history
-# ---------------------------------------------------------------------------
-
-@router.get("/{authority}/{uuid}/history", response_model=list[AssetHistoryEntry])
+@router.get("/{authority}/{record_uuid}/history", response_model=list[AssetHistoryEntry])
 async def get_asset_history(
     authority: str,
-    uuid: str,
+    record_uuid: str,
     db: AsyncSession = Depends(get_db),
 ) -> list[AssetHistoryEntry]:
-    daid = f"daid:{authority}:{uuid}"
-
-    # Verify the asset exists first
-    result = await db.execute(select(Asset).where(Asset.id == daid))
-    if result.scalar_one_or_none() is None:
-        raise HTTPException(status_code=404, detail=f"Asset not found: {daid}")
-
-    hist_result = await db.execute(
+    record_id = f"daid://{settings.NODE_DOMAIN}/{authority}/{record_uuid}"
+    rows = await db.execute(
         select(AssetHistory)
-        .where(AssetHistory.asset_id == daid)
+        .where(AssetHistory.asset_id == record_id)
         .order_by(AssetHistory.version.asc())
     )
-    return [
-        AssetHistoryEntry(
-            asset_id=h.asset_id,
-            version=h.version,
-            authority_data=AuthorityData(**(h.authority_data_json or {})),
-            metadata=AssetMetadata(**(h.metadata_json or {})),
-            updated_at=_utc(h.updated_at),
-            signature=h.signature,
-        )
-        for h in hist_result.scalars()
-    ]
+    return [AssetHistoryEntry(record=AssetRecord.model_validate(row.record_json)) for row in rows.scalars()]
+
+
+async def _push_to_peers(record: AssetRecord) -> None:
+    try:
+        import httpx
+        from ..federation.gossip import get_all_peers
+
+        peers = [peer for peer in await get_all_peers() if peer.status == "alive"]
+        endpoints = replication_endpoints(record.availability, peers)
+        async with httpx.AsyncClient(timeout=5) as client:
+            for endpoint in endpoints:
+                try:
+                    await client.post(
+                        f"{endpoint}/v3/federation/sync",
+                        json=record.model_dump(mode="json"),
+                    )
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
+def replication_endpoints(availability: AvailabilityPolicy, peers: list) -> list[str]:
+    if availability.visibility == "public":
+        return sorted({peer.endpoint.rstrip("/") for peer in peers})
+
+    from ..federation.resolver import _discovery_scheme
+
+    allowed = {node.lower() for node in availability.allowed_nodes}
+    endpoints = {
+        peer.endpoint.rstrip("/")
+        for peer in peers
+        if (urlsplit(peer.endpoint).netloc or peer.node_id).lower() in allowed
+    }
+    endpoints.update(
+        f"{_discovery_scheme(node)}://{node}"
+        for node in availability.allowed_nodes
+        if node.lower() != settings.NODE_DOMAIN.lower()
+    )
+    return sorted(endpoints)
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)

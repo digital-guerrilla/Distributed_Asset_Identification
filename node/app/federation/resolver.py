@@ -1,118 +1,74 @@
-"""
-DAID resolution — converts a DAID URI into a verified AssetRecord by
-contacting the authoritative node.
-
-Flow:
-  1. Parse authority from DAID URI
-  2. Fetch /.well-known/daid/server from that authority to get endpoint + public key
-  3. Call GET {endpoint}/v1/assets/{authority}/{uuid}
-  4. Verify Ed25519 signature
-  5. Return (AssetRecord, verified: bool, authority_endpoint: str)
-"""
-
-from datetime import datetime, timezone
+"""Discovery and cryptographic verification for one DAID v3 record."""
 
 import httpx
 
+from ..config import settings
 from ..core.crypto import NodeKeyManager
 from ..core.guid import parse_daid
 from ..core.models import AssetRecord, WellKnownResponse
 
 
-async def fetch_well_known(authority: str, timeout: int = 10) -> WellKnownResponse:
-    """
-    Fetch the DAID discovery document from an authority domain.
+def _discovery_scheme(routing_host: str) -> str:
+    host = routing_host.split(":")[0].lower()
+    local = host == "localhost" or host.replace(".", "").isdigit() or host.startswith("[")
+    return "http" if local or settings.ALLOW_INSECURE_HTTP_DISCOVERY else "https"
 
-    For proper domain names: tries HTTPS first, falls back to HTTP.
-    For IP addresses and localhost: uses HTTP only (no TLS handshake sent to
-    a plain-HTTP server, which would cause uvicorn to log spurious warnings).
 
-    Raises:
-        ValueError: If the document cannot be fetched or parsed.
-    """
-    host = authority.split(":")[0].lower()
-    is_ip_or_local = (
-        host == "localhost"
-        or host.replace(".", "").isdigit()  # IPv4
-        or host.startswith("[")              # IPv6 literal
-    )
-    if is_ip_or_local:
-        candidates = [f"http://{authority}/.well-known/daid/server"]
-    else:
-        candidates = [
-            f"https://{authority}/.well-known/daid/server",
-            f"http://{authority}/.well-known/daid/server",
-        ]
-
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        for url in candidates:
-            try:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    return WellKnownResponse(**resp.json())
-            except httpx.RequestError:
-                continue
-
-    raise ValueError(f"Could not discover DAID node for authority: {authority!r}")
+async def fetch_well_known(routing_host: str, timeout: int = 10) -> WellKnownResponse:
+    scheme = _discovery_scheme(routing_host)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        try:
+            response = await client.get(f"{scheme}://{routing_host}/.well-known/daid/server")
+            if response.status_code == 200:
+                descriptor = WellKnownResponse.model_validate(response.json())
+                method = descriptor.verification_methods[0]
+                if (
+                    descriptor.authority == descriptor.genesis_public_key_multibase
+                    and method.public_key_multibase == descriptor.authority
+                    and NodeKeyManager.verify(
+                        descriptor.model_dump(mode="json"),
+                        descriptor.proof,
+                        method.public_key_base64,
+                    )
+                ):
+                    return descriptor
+        except (httpx.RequestError, ValueError):
+            pass
+    raise ValueError(f"Could not verify DAID authority descriptor for {routing_host!r}")
 
 
 async def resolve_daid(
     daid: str,
-    key_manager: NodeKeyManager,
     timeout: int = 10,
-) -> tuple[AssetRecord, bool, str]:
-    """
-    Resolve a DAID URI to a signed asset record from the authoritative node.
-
-    Returns:
-        (asset_record, verified, authority_endpoint)
-
-    Raises:
-        ValueError: On invalid DAID, unreachable authority, or HTTP error.
-    """
+) -> tuple[AssetRecord, str, str]:
     parsed = parse_daid(daid)
+    descriptor = await fetch_well_known(parsed.routing_host, timeout)
+    if descriptor.authority != parsed.authority_key_fingerprint:
+        raise ValueError("Authority descriptor fingerprint does not match the requested DAID")
 
-    # Step 1 — discover the authority node
-    well_known = await fetch_well_known(parsed.authority, timeout=timeout)
-    endpoint = well_known.endpoint.rstrip("/")
-
-    # Step 2 — fetch the asset record
-    url = f"{endpoint}/v1/assets/{parsed.authority}/{parsed.asset_uuid}"
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+    endpoint = descriptor.endpoints[0].rstrip("/")
+    url = f"{endpoint}/v3/records/{parsed.authority_key_fingerprint}/{parsed.record_uuid}"
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
         try:
-            resp = await client.get(url)
+            response = await client.get(url, headers={"accept": "application/json"})
         except httpx.RequestError as exc:
-            raise ValueError(f"HTTP error fetching {url}: {exc}") from exc
+            raise ValueError(f"Authority request failed: {exc}") from exc
+    if response.status_code == 404:
+        raise ValueError(f"Record not found: {daid}")
+    if response.status_code != 200:
+        raise ValueError(f"Authority returned HTTP {response.status_code}")
 
-        if resp.status_code == 404:
-            raise ValueError(f"Asset not found on authority node: {daid}")
-        if resp.status_code != 200:
-            raise ValueError(
-                f"Authority node returned HTTP {resp.status_code} for {daid}"
-            )
-
-        asset_data = resp.json()
-
-    asset = AssetRecord(**asset_data)
-
-    # Step 3 — verify signature
-    signing_dict = {
-        "id": asset.id,
-        "authority": asset.authority,
-        "authority_data": asset.authority_data.model_dump(),
-        "metadata": asset.metadata.model_dump(),
-        "created_at": _utc(asset.created_at).isoformat(),
-        "updated_at": _utc(asset.updated_at).isoformat(),
-        "version": asset.version,
-    }
-    verified = bool(asset.signature) and NodeKeyManager.verify(
-        signing_dict, asset.signature, well_known.public_key
-    )
-
-    return asset, verified, endpoint
-
-
-def _utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    record = AssetRecord.model_validate(response.json())
+    if record.id != daid or record.authority != descriptor.authority:
+        raise ValueError("Authority returned a record with a mismatched identity")
+    methods = {item.id: item for item in descriptor.verification_methods}
+    method = methods.get(record.proof.verification_method)
+    if method is None or "record" not in method.purposes:
+        raise ValueError("Record proof uses an unknown or unauthorized verification method")
+    if not NodeKeyManager.verify(
+        record.model_dump(mode="json"),
+        record.proof.proof_value,
+        method.public_key_base64,
+    ):
+        raise ValueError("Record proof verification failed")
+    return record, endpoint, response.text

@@ -1,28 +1,26 @@
-"""
-Node information endpoint.
-
-GET /v1/node/info  — returns node identity, public key, and capabilities.
-"""
+"""DAID v3 node information endpoint."""
 
 from fastapi import APIRouter, Depends
 
 from ..config import settings
 from ..core.crypto import NodeKeyManager
 from ..core.models import NodeInfo
-from ..dependencies import get_key_manager
+from ..dependencies import get_key_manager, require_api_key
 
-router = APIRouter(prefix="/v1/node", tags=["node"])
+router = APIRouter(prefix="/v3/node", tags=["node"])
 
 
 @router.get("/info", response_model=NodeInfo)
 async def get_node_info(
     key_manager: NodeKeyManager = Depends(get_key_manager),
 ) -> NodeInfo:
-    features = ["assets", "federation", "history", "resolve", "jsonld", "schema.org", "ifc-psets"]
-    if settings.NODE_ROLE in ("resolver", "full"):
-        features.append("gossip")
     return NodeInfo(
-        node_id=settings.NODE_DOMAIN,
-        public_key=key_manager.public_key_b64,
-        supported_features=features,
+        routing_host=settings.NODE_DOMAIN,
+        authority=key_manager.public_key_multibase,
+        role=settings.NODE_ROLE,
     )
+
+
+@router.get("/access")
+async def check_node_access(_: None = Depends(require_api_key)) -> dict:
+    return {"authorized": True, "routing_host": settings.NODE_DOMAIN, "role": settings.NODE_ROLE}

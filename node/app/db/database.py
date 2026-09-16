@@ -58,6 +58,15 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+async def close_db() -> None:
+    """Dispose database connections during application shutdown."""
+    global _engine, _AsyncSessionLocal
+    if _engine is not None:
+        await _engine.dispose()
+    _engine = None
+    _AsyncSessionLocal = None
+
+
 def AsyncSessionLocal() -> AsyncSession:
     """
     Return a new async session context manager.

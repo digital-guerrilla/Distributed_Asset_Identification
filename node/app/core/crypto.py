@@ -1,24 +1,16 @@
-"""
-Ed25519 cryptographic operations for DAID nodes.
-
-Each node holds a single Ed25519 keypair:
-  - Private key: used to sign every record issued by this node
-  - Public key:  published via /.well-known/daid/server; used by anyone to verify
-
-Signing input is canonical JSON — dict serialized with sorted keys, no
-whitespace, and with the "signature" field excluded.
-"""
+"""RFC 8785 / Ed25519 cryptographic operations for DAID v3 nodes."""
 
 import base64
 import hashlib
-import json
 import os
-from datetime import datetime, timezone
 from typing import Any
 
-import nacl.encoding
 import nacl.exceptions
 import nacl.signing
+import rfc8785
+
+
+_BASE58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
 class NodeKeyManager:
@@ -48,6 +40,11 @@ class NodeKeyManager:
         return base64.b64encode(bytes(self._verify_key)).decode()
 
     @property
+    def public_key_multibase(self) -> str:
+        """Ed25519 public key as a did:key-compatible multibase fingerprint."""
+        return "z" + _base58btc_encode(b"\xed\x01" + bytes(self._verify_key))
+
+    @property
     def private_key_bytes(self) -> bytes:
         """Raw 32-byte private key (seed). Keep this secret."""
         return bytes(self._signing_key)
@@ -58,14 +55,13 @@ class NodeKeyManager:
 
     def sign_record(self, record: dict[str, Any]) -> str:
         """
-        Sign a record dict and return a base64-encoded Ed25519 signature.
+        Sign a record dict and return a base64url-encoded Ed25519 proof value.
 
-        The "signature" key is excluded from the signing payload so that
-        the signature can be stored alongside the signed data.
+        The top-level proof is excluded so it can travel with the signed data.
         """
-        payload = _canonical_json(record)
-        signed = self._signing_key.sign(payload.encode())
-        return base64.b64encode(signed.signature).decode()
+        payload = canonicalize(record)
+        signed = self._signing_key.sign(payload)
+        return base64.urlsafe_b64encode(signed.signature).decode().rstrip("=")
 
     # ------------------------------------------------------------------
     # Verification (static — doesn't need the private key)
@@ -77,8 +73,8 @@ class NodeKeyManager:
         Verify an Ed25519 signature over a record dict.
 
         Args:
-            record:         The asset record dict (may include "signature" key).
-            signature_b64:  Base64-encoded 64-byte signature.
+            record:         The record document (may include its proof).
+            signature_b64:  Base64url-encoded 64-byte signature.
             public_key_b64: Base64-encoded 32-byte Ed25519 public key.
 
         Returns:
@@ -87,9 +83,10 @@ class NodeKeyManager:
         try:
             pub_key_bytes = base64.b64decode(public_key_b64)
             verify_key = nacl.signing.VerifyKey(pub_key_bytes)
-            payload = _canonical_json(record)
-            sig_bytes = base64.b64decode(signature_b64)
-            verify_key.verify(payload.encode(), sig_bytes)
+            payload = canonicalize(record)
+            padding = "=" * (-len(signature_b64) % 4)
+            sig_bytes = base64.urlsafe_b64decode(signature_b64 + padding)
+            verify_key.verify(payload, sig_bytes)
             return True
         except (nacl.exceptions.BadSignatureError, Exception):
             return False
@@ -112,7 +109,7 @@ class NodeKeyManager:
         os.makedirs(os.path.dirname(os.path.abspath(key_file)), exist_ok=True)
         with open(key_file, "wb") as f:
             f.write(km.private_key_bytes)
-        print(f"[daid] Generated new Ed25519 keypair → {key_file}")
+        print(f"[daid] Generated new Ed25519 keypair -> {key_file}")
         print(f"[daid] Public key: {km.public_key_b64}")
         return km
 
@@ -121,24 +118,27 @@ class NodeKeyManager:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _canonical_json(record: dict[str, Any]) -> str:
-    """
-    Produce the deterministic, canonical JSON payload for signing.
-
-    Rules:
-      - Exclude the top-level "signature" key
-      - Sort all dict keys recursively
-      - No extra whitespace
-      - datetime objects serialized as UTC ISO 8601
-    """
-    record_copy = {k: v for k, v in record.items() if k != "signature"}
-    return json.dumps(record_copy, sort_keys=True, separators=(",", ":"), default=_json_default)
+def canonicalize(document: dict[str, Any]) -> bytes:
+    """Return RFC 8785 canonical bytes, excluding only a top-level proof."""
+    unsigned = {key: value for key, value in document.items() if key != "proof"}
+    return rfc8785.dumps(unsigned)
 
 
-def _json_default(obj: Any) -> Any:
-    if isinstance(obj, datetime):
-        return obj.astimezone(timezone.utc).isoformat()
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+def canonical_sha256(document: dict[str, Any]) -> str:
+    """Return the digest used by snapshot relationship integrity policies."""
+    return hashlib.sha256(canonicalize(document)).hexdigest()
+
+
+def _base58btc_encode(value: bytes) -> str:
+    leading_zeroes = len(value) - len(value.lstrip(b"\0"))
+    number = int.from_bytes(value, "big")
+    encoded = bytearray()
+    while number:
+        number, remainder = divmod(number, 58)
+        encoded.append(_BASE58_ALPHABET[remainder])
+    encoded.extend(_BASE58_ALPHABET[0] for _ in range(leading_zeroes))
+    encoded.reverse()
+    return encoded.decode()
 
 
 def sha256_hex(data: str) -> str:

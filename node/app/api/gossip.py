@@ -1,9 +1,4 @@
-"""
-Gossip protocol HTTP endpoints.
-
-  POST /v1/gossip/sync   — Exchange membership digests with a peer
-  GET  /v1/gossip/peers  — Inspect this node's membership table (read-only)
-"""
+"""Gossip protocol HTTP endpoints."""
 
 import logging
 
@@ -14,7 +9,7 @@ from ..federation import gossip as gossip_engine
 
 logger = logging.getLogger("daid.gossip.api")
 
-router = APIRouter(prefix="/v1/gossip", tags=["gossip"])
+router = APIRouter(prefix="/v3/gossip", tags=["gossip"])
 
 
 @router.post("/sync", response_model=GossipSyncResponse)

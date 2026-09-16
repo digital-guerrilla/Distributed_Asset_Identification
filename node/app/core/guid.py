@@ -1,14 +1,4 @@
-"""
-DAID URI parsing and generation.
-
-Format: daid:{authority}:{uuid4}
-  authority = hostname or hostname:port
-  uuid4     = standard UUID v4 string
-
-Examples:
-  daid:products.acme.com:550e8400-e29b-41d4-a716-446655440000
-  daid:localhost:8001:a8098c1a-f86e-11da-bd1a-00112444be1e
-"""
+"""DAID v3 URI parsing and generation."""
 
 import re
 import uuid
@@ -16,44 +6,36 @@ from dataclasses import dataclass
 
 DAID_SCHEME = "daid"
 
-# Matches: daid:{authority}:{uuid4}
-# authority = hostname optionally with :port
-# uuid4     = 8-4-4-4-12 hex groups where third group starts with '4'
-#             and fourth group starts with 8/9/a/b
 _DAID_RE = re.compile(
-    r'^daid:'
-    r'([a-zA-Z0-9._-]+(?::\d+)?)'   # authority (group 1)
-    r':'
-    r'([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})'  # uuid4 (group 2)
-    r'$',
+    r"^daid://"
+    r"([a-zA-Z0-9.-]+(?::\d+)?)"
+    r"/(z[1-9A-HJ-NP-Za-km-z]+)"
+    r"/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$",
     re.IGNORECASE,
 )
 
 
 @dataclass(frozen=True)
 class ParsedDAID:
-    authority: str
-    asset_uuid: str
+    routing_host: str
+    authority_key_fingerprint: str
+    record_uuid: str
 
     @property
     def full_id(self) -> str:
-        return f"daid:{self.authority}:{self.asset_uuid}"
+        return (
+            f"daid://{self.routing_host}/{self.authority_key_fingerprint}/"
+            f"{self.record_uuid}"
+        )
 
     def __str__(self) -> str:
         return self.full_id
 
 
-def generate_daid(authority: str) -> str:
-    """
-    Generate a new DAID URI for the given authority.
-
-    Args:
-        authority: The authority domain (e.g. "products.acme.com" or "localhost:8000")
-
-    Returns:
-        A new DAID URI string, e.g. "daid:products.acme.com:550e8400-..."
-    """
-    return f"daid:{authority}:{uuid.uuid4()}"
+def generate_daid(routing_host: str, authority_key_fingerprint: str) -> str:
+    """Generate a self-certifying DAID v3 URI."""
+    candidate = f"daid://{routing_host}/{authority_key_fingerprint}/{uuid.uuid4()}"
+    return parse_daid(candidate).full_id
 
 
 def parse_daid(daid: str) -> ParsedDAID:
@@ -67,9 +49,13 @@ def parse_daid(daid: str) -> ParsedDAID:
     if not match:
         raise ValueError(
             f"Invalid DAID URI: {daid!r}. "
-            f"Expected format: daid:{{authority}}:{{uuid4}}"
+            "Expected format: daid://{routing-host}/{authority-key-fingerprint}/{uuid4}"
         )
-    return ParsedDAID(authority=match.group(1).lower(), asset_uuid=match.group(2).lower())
+    return ParsedDAID(
+        routing_host=match.group(1).lower(),
+        authority_key_fingerprint=match.group(2),
+        record_uuid=match.group(3).lower(),
+    )
 
 
 def is_valid_daid(daid: str) -> bool:

@@ -1,23 +1,12 @@
-"""
-/.well-known/daid/server  — Node discovery document.
+"""Signed authority descriptor for DAID v3 discovery."""
 
-This endpoint is the trust anchor for the DAID protocol.
-Any resolver fetches this before contacting the node API.
-
-Response format:
-  {
-    "endpoint":    "https://api.acme.com",
-    "node_id":     "products.acme.com",
-    "public_key":  "base64 Ed25519 pubkey",
-    "api_version": "1.0"
-  }
-"""
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends
 
 from ..config import settings
 from ..core.crypto import NodeKeyManager
-from ..core.models import WellKnownResponse
+from ..core.models import VerificationMethod, WellKnownResponse
 from ..dependencies import get_key_manager
 
 router = APIRouter(tags=["discovery"])
@@ -27,15 +16,24 @@ router = APIRouter(tags=["discovery"])
 async def well_known_server(
     key_manager: NodeKeyManager = Depends(get_key_manager),
 ) -> WellKnownResponse:
-    """
-    Return the discovery document for this node.
-
-    Clients parse the authority from a DAID URI, then fetch this endpoint
-    on that authority's domain to learn the API base URL and public key.
-    """
-    return WellKnownResponse(
-        endpoint=settings.NODE_API_BASE,
-        node_id=settings.NODE_DOMAIN,
-        public_key=key_manager.public_key_b64,
-        api_version="1.0",
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    controller = settings.DID_WEB_ID or f"did:web:{settings.NODE_DOMAIN.replace(':', '%3A')}"
+    method = VerificationMethod(
+        id=f"{controller}#daid-record-signing",
+        public_key_multibase=key_manager.public_key_multibase,
+        public_key_base64=key_manager.public_key_b64,
+        purposes=["record", "relationship-assertion", "relationship-acceptance"],
+        valid_from=now,
     )
+    descriptor = WellKnownResponse(
+        authority=key_manager.public_key_multibase,
+        genesis_public_key_multibase=key_manager.public_key_multibase,
+        endpoints=[settings.NODE_API_BASE.rstrip("/")],
+        verification_methods=[method],
+        sequence=1,
+        expires_at=now + timedelta(days=30),
+        proof="unsigned",
+    )
+    document = descriptor.model_dump(mode="json")
+    document["proof"] = key_manager.sign_record(document)
+    return WellKnownResponse.model_validate(document)

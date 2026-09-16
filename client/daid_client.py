@@ -1,119 +1,51 @@
-"""
-DAID Python Client SDK
-
-Simple async client for interacting with any DAID node.
-
-Usage:
-    import asyncio
-    from client.daid_client import DAIDClient
-
-    async def main():
-        async with DAIDClient("http://localhost:8000", api_key="my-key") as client:
-            asset = await client.create_asset({"name": "Widget"})
-            print(asset.id)
-            result = await client.resolve(asset.id)
-            print(result.verified)
-
-    asyncio.run(main())
-"""
+"""Async client for DAID v3 nodes."""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
-# ---------------------------------------------------------------------------
-# Data classes returned by the SDK
-# ---------------------------------------------------------------------------
 
 @dataclass
-class AssetResult:
+class RecordResult:
     id: str
     authority: str
-    authority_data: dict          # core identity: name, manufacturer, model_number, ...
-    metadata: dict                # extended optional fields
+    controller: str
+    record_kind: str
+    subject: dict[str, Any]
+    relationships: list[dict[str, Any]]
+    availability: dict[str, Any]
     version: int
     created_at: str
     updated_at: str
-    signature: str | None
+    proof: dict[str, Any]
 
     @property
     def name(self) -> str:
-        return self.authority_data.get("name", "")
-
-    @property
-    def manufacturer(self) -> str:
-        return self.authority_data.get("manufacturer", "")
-
-    @property
-    def model_number(self) -> str:
-        return self.authority_data.get("model_number", "")
-
-    @property
-    def authority_from_id(self) -> str:
-        """Extract authority from the DAID URI."""
-        parts = self.id.split(":")
-        return parts[1] if len(parts) >= 3 else ""
-
-    @property
-    def uuid(self) -> str:
-        """Extract UUID from the DAID URI."""
-        parts = self.id.split(":")
-        return parts[2] if len(parts) >= 3 else ""
-
-
-@dataclass
-class ResolveResult:
-    asset: AssetResult
-    verified: bool
-    source: str
-    authority_endpoint: Optional[str] = None
+        return str(self.subject.get("name", ""))
 
 
 @dataclass
 class NodeInfo:
-    node_id: str
-    public_key: str
-    api_version: str
-    supported_features: list[str] = field(default_factory=list)
+    routing_host: str
+    authority: str
+    protocol_version: str
+    supported_record_kinds: list[str] = field(default_factory=list)
+    role: str = "resolver"
 
-
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
 
 class DAIDClient:
-    """
-    Async HTTP client for a DAID node.
-
-    Can be used as an async context manager or with explicit open/close.
-
-    Args:
-        node_url:  Base URL of the DAID node, e.g. "http://localhost:8000"
-        api_key:   API key for write operations (POST /v1/assets, PUT /v1/assets/...)
-        timeout:   Default request timeout in seconds
-    """
-
-    def __init__(
-        self,
-        node_url: str,
-        api_key: Optional[str] = None,
-        timeout: int = 15,
-    ):
+    def __init__(self, node_url: str, api_key: str | None = None, timeout: int = 15):
         self._base = node_url.rstrip("/")
         self._api_key = api_key
         self._timeout = timeout
-        self._client: Optional[httpx.AsyncClient] = None
-
-    # ------------------------------------------------------------------
-    # Context manager support
-    # ------------------------------------------------------------------
+        self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> "DAIDClient":
-        self._client = httpx.AsyncClient(timeout=self._timeout, follow_redirects=True)
+        self._client = httpx.AsyncClient(timeout=self._timeout, follow_redirects=False)
         return self
 
     async def __aexit__(self, *_) -> None:
@@ -121,212 +53,151 @@ class DAIDClient:
             await self._client.aclose()
             self._client = None
 
-    def _get_client(self) -> httpx.AsyncClient:
+    def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            # Allow one-shot use without context manager
-            self._client = httpx.AsyncClient(timeout=self._timeout, follow_redirects=True)
+            self._client = httpx.AsyncClient(timeout=self._timeout, follow_redirects=False)
         return self._client
 
-    def _headers(self, write: bool = False) -> dict:
-        h: dict = {"Content-Type": "application/json"}
+    def _headers(self, write: bool = False) -> dict[str, str]:
+        headers = {"accept": "application/json"}
         if write:
             if not self._api_key:
                 raise ValueError("api_key is required for write operations")
-            h["x-api-key"] = self._api_key
-        return h
-
-    # ------------------------------------------------------------------
-    # Node info
-    # ------------------------------------------------------------------
+            headers["x-api-key"] = self._api_key
+        return headers
 
     async def get_node_info(self) -> NodeInfo:
-        """Fetch node identity and capabilities."""
-        resp = await self._get_client().get(
-            f"{self._base}/v1/node/info", headers=self._headers()
+        response = await self._http().get(f"{self._base}/v3/node/info")
+        response.raise_for_status()
+        return NodeInfo(**response.json())
+
+    async def get_well_known(self) -> dict[str, Any]:
+        response = await self._http().get(f"{self._base}/.well-known/daid/server")
+        response.raise_for_status()
+        return response.json()
+
+    async def get_record(self, daid: str) -> RecordResult:
+        authority, record_uuid = _split_daid(daid)
+        response = await self._http().get(
+            f"{self._base}/v3/records/{authority}/{record_uuid}"
         )
-        resp.raise_for_status()
-        d = resp.json()
-        return NodeInfo(
-            node_id=d["node_id"],
-            public_key=d["public_key"],
-            api_version=d["api_version"],
-            supported_features=d.get("supported_features", []),
-        )
+        response.raise_for_status()
+        return _parse_record(response.json())
 
-    async def get_well_known(self) -> dict:
-        """Fetch the /.well-known/daid/server discovery document."""
-        resp = await self._get_client().get(f"{self._base}/.well-known/daid/server")
-        resp.raise_for_status()
-        return resp.json()
-
-    # ------------------------------------------------------------------
-    # Asset reads
-    # ------------------------------------------------------------------
-
-    async def get_asset(self, daid: str) -> AssetResult:
-        """
-        Fetch an asset directly from this node's local store.
-        Returns 404 if not held by this node.
-        """
-        authority, uuid = _split_daid(daid)
-        resp = await self._get_client().get(
-            f"{self._base}/v1/assets/{authority}/{uuid}", headers=self._headers()
-        )
-        resp.raise_for_status()
-        return _parse_asset(resp.json())
-
-    async def list_assets(self, limit: int = 50, offset: int = 0) -> list[AssetResult]:
-        """List assets held by this node."""
-        resp = await self._get_client().get(
-            f"{self._base}/v1/assets",
+    async def list_records(self, limit: int = 50, offset: int = 0) -> list[RecordResult]:
+        response = await self._http().get(
+            f"{self._base}/v3/records",
             params={"limit": limit, "offset": offset},
-            headers=self._headers(),
         )
-        resp.raise_for_status()
-        return [_parse_asset(a) for a in resp.json()["items"]]
+        response.raise_for_status()
+        return [_parse_record(item) for item in response.json()["items"]]
 
-    async def get_history(self, daid: str) -> list[dict]:
-        """Fetch version history for an asset."""
-        authority, uuid = _split_daid(daid)
-        resp = await self._get_client().get(
-            f"{self._base}/v1/assets/{authority}/{uuid}/history",
-            headers=self._headers(),
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    # ------------------------------------------------------------------
-    # Resolve (network-aware)
-    # ------------------------------------------------------------------
-
-    async def resolve(self, daid: str) -> ResolveResult:
-        """
-        Resolve any DAID from the network.
-
-        This node will route to the authoritative node automatically,
-        verify the signature, and return the result.
-        """
-        authority, uuid = _split_daid(daid)
-        resp = await self._get_client().get(
-            f"{self._base}/v1/resolve/{authority}/{uuid}", headers=self._headers()
-        )
-        resp.raise_for_status()
-        d = resp.json()
-        return ResolveResult(
-            asset=_parse_asset(d["asset"]),
-            verified=d["verified"],
-            source=d["source"],
-            authority_endpoint=d.get("authority_endpoint"),
-        )
-
-    async def get_jsonld(self, daid: str) -> dict:
-        """Fetch the asset as a schema.org JSON-LD document."""
-        authority, uuid = _split_daid(daid)
-        resp = await self._get_client().get(
-            f"{self._base}/v1/assets/{authority}/{uuid}/jsonld",
-            headers={"Accept": "application/ld+json"},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-    async def get_gossip_peers(self) -> list[dict]:
-        """Return this node's current gossip membership view."""
-        resp = await self._get_client().get(f"{self._base}/v1/gossip/peers")
-        resp.raise_for_status()
-        return resp.json()
-
-    # ------------------------------------------------------------------
-    # Asset writes (require api_key)
-    # ------------------------------------------------------------------
-
-    async def create_asset(
+    async def create_record(
         self,
-        authority_data: dict,
-        metadata: dict | None = None,
-    ) -> AssetResult:
-        """
-        Register a new asset on this node.
-        authority_data must include: name, manufacturer, model_number
-        metadata is optional extended fields.
-        """
-        resp = await self._get_client().post(
-            f"{self._base}/v1/assets",
-            json={"authority_data": authority_data, "metadata": metadata or {}},
+        record_kind: str,
+        subject: dict[str, Any],
+        *,
+        controller: str | None = None,
+        availability: dict[str, Any] | None = None,
+    ) -> RecordResult:
+        payload: dict[str, Any] = {"record_kind": record_kind, "subject": subject}
+        if controller:
+            payload["controller"] = controller
+        if availability:
+            payload["availability"] = availability
+        response = await self._http().post(
+            f"{self._base}/v3/records",
+            json=payload,
             headers=self._headers(write=True),
         )
-        resp.raise_for_status()
-        return _parse_asset(resp.json())
+        response.raise_for_status()
+        return _parse_record(response.json())
 
-    async def update_asset(
+    async def update_record(
         self,
-        daid: str,
-        authority_data: dict,
-        metadata: dict | None = None,
-    ) -> AssetResult:
-        """
-        Update an asset's authority data and/or metadata.
-        Requires api_key. This node must be authoritative for the asset.
-        """
-        authority, uuid = _split_daid(daid)
-        resp = await self._get_client().put(
-            f"{self._base}/v1/assets/{authority}/{uuid}",
-            json={"authority_data": authority_data, "metadata": metadata or {}},
-            headers=self._headers(write=True),
-        )
-        resp.raise_for_status()
-        return _parse_asset(resp.json())
-
-    # ------------------------------------------------------------------
-    # Federation helpers
-    # ------------------------------------------------------------------
-
-    async def push_to_peer(self, peer_url: str, daid: str) -> bool:
-        """
-        Read a local asset and push it to a peer node's federation endpoint.
-        The peer will verify the signature independently.
-        """
-        asset_resp = await self.get_asset(daid)
-        peer_base = peer_url.rstrip("/")
-        resp = await self._get_client().post(
-            f"{peer_base}/v1/federation/sync",
+        record: RecordResult,
+        subject: dict[str, Any],
+    ) -> RecordResult:
+        authority, record_uuid = _split_daid(record.id)
+        response = await self._http().put(
+            f"{self._base}/v3/records/{authority}/{record_uuid}",
             json={
-                "id": asset_resp.id,
-                "authority": asset_resp.authority,
-                "authority_data": asset_resp.authority_data,
-                "metadata": asset_resp.metadata,
-                "version": asset_resp.version,
-                "created_at": asset_resp.created_at,
-                "updated_at": asset_resp.updated_at,
-                "signature": asset_resp.signature,
+                "subject": subject,
+                "controller": record.controller,
+                "relationships": record.relationships,
+                "availability": record.availability,
             },
+            headers=self._headers(write=True),
         )
-        return resp.status_code == 202
+        response.raise_for_status()
+        return _parse_record(response.json())
 
+    async def get_history(self, daid: str) -> list[dict[str, Any]]:
+        authority, record_uuid = _split_daid(daid)
+        response = await self._http().get(
+            f"{self._base}/v3/records/{authority}/{record_uuid}/history"
+        )
+        response.raise_for_status()
+        return response.json()
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+    async def resolve_graph(
+        self,
+        root: str,
+        *,
+        depth: int = 2,
+        max_nodes: int = 50,
+        view: str = "public",
+    ) -> dict[str, Any]:
+        response = await self._http().post(
+            f"{self._base}/v3/resolve-graph",
+            json={"root": root, "depth": depth, "max_nodes": max_nodes, "view": view},
+        )
+        response.raise_for_status()
+        return response.json()
 
-_DAID_RE = re.compile(
-    r'^daid:([a-zA-Z0-9._:-]+):([0-9a-f-]{36})$', re.IGNORECASE
-)
+    async def propose_relationship(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        response = await self._http().post(
+            f"{self._base}/v3/relationships/proposals",
+            json=proposal,
+            headers=self._headers(write=True),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def accept_relationship(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        response = await self._http().post(
+            f"{self._base}/v3/relationships/accept",
+            json=proposal,
+            headers=self._headers(write=True),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def get_gossip_peers(self) -> list[dict[str, Any]]:
+        response = await self._http().get(f"{self._base}/v3/gossip/peers")
+        response.raise_for_status()
+        return response.json()
 
 
 def _split_daid(daid: str) -> tuple[str, str]:
-    m = _DAID_RE.match(daid.strip())
-    if not m:
+    parsed = urlsplit(daid)
+    parts = parsed.path.strip("/").split("/")
+    if parsed.scheme != "daid" or not parsed.netloc or len(parts) != 2:
         raise ValueError(f"Invalid DAID URI: {daid!r}")
-    return m.group(1), m.group(2)
+    return parts[0], parts[1]
 
 
-def _parse_asset(d: dict) -> AssetResult:
-    return AssetResult(
-        id=d["id"],
-        authority=d["authority"],
-        authority_data=d["authority_data"],
-        metadata=d.get("metadata") or {},
-        version=d["version"],
-        created_at=d["created_at"],
-        updated_at=d["updated_at"],
-        signature=d.get("signature"),
+def _parse_record(document: dict[str, Any]) -> RecordResult:
+    return RecordResult(
+        id=document["id"],
+        authority=document["authority"],
+        controller=document["controller"],
+        record_kind=document["record_kind"],
+        subject=document["subject"],
+        relationships=document.get("relationships", []),
+        availability=document["availability"],
+        version=document["version"],
+        created_at=document["created_at"],
+        updated_at=document["updated_at"],
+        proof=document["proof"],
     )

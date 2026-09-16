@@ -1,186 +1,186 @@
-"""
-Network-aware resolve endpoint.
+"""Bounded, cycle-safe DAID v3 graph resolution."""
 
-GET /v1/resolve/{authority}/{uuid}
-
-Resolves any DAID from the entire DAID network, not just records held locally:
-
-  1. If this node is the authority → serve directly (fast path)
-  2. Else, check local cache.  If found and not stale → return cached record.
-  3. Else, resolve from the authoritative node via federation, verify sig,
-     cache the result, and return it.
-
-Response:
-  {
-    "asset":               {AssetRecord},
-    "verified":            true | false,
-    "source":              "local_authoritative" | "local_cache" | "remote_authoritative",
-    "authority_endpoint":  "https://..."
-  }
-"""
-
+import asyncio
 from datetime import datetime, timedelta, timezone
 
-import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import settings
-from ..core.crypto import NodeKeyManager
-from ..core.models import AssetMetadata, AssetRecord, AuthorityData, ResolveResponse
-from ..db.database import get_db
+from ..core.guid import parse_daid
+from ..core.models import (
+    AssetRecord,
+    GraphFailure,
+    GraphLimits,
+    GraphNode,
+    ResolveGraphRequest,
+    ResolveGraphResponse,
+    ResolveResponse,
+)
+from ..db.database import AsyncSessionLocal
 from ..db.orm_models import Asset
-from ..dependencies import get_key_manager
+from ..dependencies import valid_api_key
 from ..federation.resolver import resolve_daid
 
-router = APIRouter(prefix="/v1/resolve", tags=["resolve"])
+router = APIRouter(prefix="/v3", tags=["resolution"])
 
 
-# ---------------------------------------------------------------------------
-# Browse — proxy a remote node's asset list (avoids browser CORS)
-# MUST be defined before /{authority}/{uuid} to avoid route shadowing.
-# ---------------------------------------------------------------------------
-
-@router.get("/browse/{authority:path}")
-async def browse_authority(
-    authority: str,
-    limit: int = Query(200, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-) -> dict:
-    """
-    Fetch the asset list from any authority node and return it,
-    so the client UI can browse remote nodes without CORS issues.
-    Falls back to the local /v1/assets when authority == this node.
-    """
-    if authority.lower() == settings.NODE_DOMAIN.lower():
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"{settings.NODE_API_BASE}/v1/assets",
-                params={"limit": limit, "offset": offset},
-            )
-    else:
-        base = f"http://{authority}"
-        async with httpx.AsyncClient(timeout=10) as client:
-            try:
-                r = await client.get(
-                    f"{base}/v1/assets",
-                    params={"limit": limit, "offset": offset},
-                )
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Could not reach {authority}: {exc}",
-                )
-    if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, detail=f"Remote node returned {r.status_code}")
-    return r.json()
+class RestrictedRecordError(Exception):
+    pass
 
 
-@router.get("/{authority}/{uuid}", response_model=ResolveResponse)
-async def resolve(
-    authority: str,
-    uuid: str,
-    refresh: bool = False,
-    db: AsyncSession = Depends(get_db),
-    key_manager: NodeKeyManager = Depends(get_key_manager),
-) -> ResolveResponse:
-    daid = f"daid:{authority}:{uuid}"
-
-    # ------------------------------------------------------------------
-    # Fast path: this node is the authority
-    # ------------------------------------------------------------------
-    if authority.lower() == settings.NODE_DOMAIN.lower():
-        result = await db.execute(select(Asset).where(Asset.id == daid))
-        asset = result.scalar_one_or_none()
-        if asset is None:
-            raise HTTPException(status_code=404, detail=f"Asset not found: {daid}")
+async def _resolve_one(daid: str, db: AsyncSession, allow_restricted: bool) -> ResolveResponse:
+    parsed = parse_daid(daid)
+    row = (await db.execute(select(Asset).where(Asset.id == daid))).scalar_one_or_none()
+    if row and AssetRecord.model_validate(row.record_json).availability.visibility == "restricted" and not allow_restricted:
+        raise RestrictedRecordError("Record access is restricted")
+    if row and row.is_authoritative:
         return ResolveResponse(
-            asset=_orm_to_record(asset),
+            record=AssetRecord.model_validate(row.record_json),
             verified=True,
             source="local_authoritative",
             authority_endpoint=settings.NODE_API_BASE,
         )
-
-    # ------------------------------------------------------------------
-    # Check local cache (respect CACHE_TTL)
-    # ------------------------------------------------------------------
-    result = await db.execute(select(Asset).where(Asset.id == daid))
-    cached = result.scalar_one_or_none()
-
-    if not refresh and cached and cached.cached_at and settings.CACHE_TTL > 0:
-        age = datetime.now(timezone.utc) - _utc(cached.cached_at)
+    if row and row.cached_at and settings.CACHE_TTL > 0:
+        age = datetime.now(timezone.utc) - _utc(row.cached_at)
         if age < timedelta(seconds=settings.CACHE_TTL):
             return ResolveResponse(
-                asset=_orm_to_record(cached),
-                verified=False,  # Not re-verified this request; trust the stored sig
+                record=AssetRecord.model_validate(row.record_json),
+                verified=True,
                 source="local_cache",
+                verified_at=_utc(row.verified_at or row.cached_at),
             )
-
-    # ------------------------------------------------------------------
-    # Resolve from the authoritative node
-    # ------------------------------------------------------------------
     try:
-        asset_record, verified, endpoint = await resolve_daid(daid, key_manager)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to resolve {daid} from authority node: {exc}",
-        )
+        record, endpoint, raw_payload = await resolve_daid(daid, settings.FEDERATION_TIMEOUT)
+    except ValueError:
+        if row:
+            return ResolveResponse(
+                record=AssetRecord.model_validate(row.record_json),
+                verified=True,
+                source="local_cache",
+                trust_state="verified_stale",
+                verified_at=_utc(row.verified_at or row.cached_at or row.updated_at),
+            )
+        raise
 
-    # Cache the verified result locally
     now = datetime.now(timezone.utc)
-    if cached:
-        if asset_record.version >= cached.version:
-            cached.authority_data_json = asset_record.authority_data.model_dump()
-            cached.metadata_json = asset_record.metadata.model_dump()
-            cached.updated_at = _utc(asset_record.updated_at)
-            cached.version = asset_record.version
-            cached.signature = asset_record.signature
-            cached.cached_at = now
+    document = record.model_dump(mode="json")
+    if row:
+        if record.version >= row.version:
+            row.record_json = document
+            row.raw_payload = raw_payload
+            row.controller = record.controller
+            row.record_kind = record.record_kind.value
+            row.updated_at = record.updated_at
+            row.version = record.version
+            row.cached_at = now
+            row.verified_at = now
     else:
         db.add(Asset(
-            id=asset_record.id,
-            authority=asset_record.authority,
-            authority_data_json=asset_record.authority_data.model_dump(),
-            metadata_json=asset_record.metadata.model_dump(),
-            created_at=_utc(asset_record.created_at),
-            updated_at=_utc(asset_record.updated_at),
-            version=asset_record.version,
-            signature=asset_record.signature,
+            id=record.id,
+            routing_host=parsed.routing_host,
+            authority=record.authority,
+            controller=record.controller,
+            record_kind=record.record_kind.value,
+            record_json=document,
+            raw_payload=raw_payload,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            version=record.version,
             is_authoritative=False,
             cached_at=now,
+            verified_at=now,
         ))
     await db.commit()
-
     return ResolveResponse(
-        asset=asset_record,
-        verified=verified,
+        record=record,
+        verified=True,
         source="remote_authoritative",
         authority_endpoint=endpoint,
+        verified_at=now,
     )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@router.post("/resolve-graph", response_model=ResolveGraphResponse)
+async def resolve_graph(
+    request: ResolveGraphRequest,
+    x_api_key: str | None = Header(default=None),
+) -> ResolveGraphResponse:
+    authenticated = valid_api_key(x_api_key)
+    if request.view != "public" and not authenticated:
+        raise HTTPException(status_code=401, detail="Partner and confidential views require the local node API key")
+    allow_restricted = request.view != "public" and authenticated
+    nodes: dict[str, GraphNode] = {}
+    edges = []
+    failures: list[GraphFailure] = []
+    frontier = {request.root}
+    scheduled = {request.root}
+    reached_depth = 0
+    truncated = False
 
-def _orm_to_record(asset: Asset) -> AssetRecord:
-    return AssetRecord(
-        id=asset.id,
-        authority=asset.authority,
-        authority_data=AuthorityData(**(asset.authority_data_json or {})),
-        metadata=AssetMetadata(**(asset.metadata_json or {})),
-        created_at=_utc(asset.created_at),
-        updated_at=_utc(asset.updated_at),
-        version=asset.version,
-        signature=asset.signature,
+    for depth in range(request.depth + 1):
+        if not frontier:
+            break
+        reached_depth = depth
+        async def resolve_independently(daid: str) -> ResolveResponse:
+            async with AsyncSessionLocal() as session:
+                return await _resolve_one(daid, session, allow_restricted)
+
+        outcomes = await asyncio.gather(
+            *[resolve_independently(daid) for daid in sorted(frontier)],
+            return_exceptions=True,
+        )
+        next_frontier: set[str] = set()
+        for daid, outcome in zip(sorted(frontier), outcomes):
+            if not isinstance(outcome, ResolveResponse):
+                restricted = isinstance(outcome, RestrictedRecordError)
+                failures.append(GraphFailure(
+                    daid=daid,
+                    status="restricted" if restricted else "unavailable",
+                    reason_code=str(outcome),
+                    retryable=not restricted,
+                ))
+                continue
+            nodes[daid] = GraphNode(
+                status=outcome.trust_state,
+                record=outcome.record,
+                source=outcome.source,
+                verified_at=outcome.verified_at,
+            )
+            for edge in sorted(outcome.record.relationships, key=lambda item: item.relationship_id):
+                edges.append(edge)
+                if edge.target in scheduled or depth >= request.depth:
+                    continue
+                if len(scheduled) >= request.max_nodes:
+                    truncated = True
+                    continue
+                scheduled.add(edge.target)
+                next_frontier.add(edge.target)
+        frontier = next_frontier
+
+    if request.root not in nodes:
+        if any(failure.daid == request.root and failure.status == "restricted" for failure in failures):
+            raise HTTPException(status_code=403, detail="Root record access is restricted")
+        reason = failures[0].reason_code if failures else "Root could not be resolved"
+        raise HTTPException(status_code=502, detail=reason)
+    return ResolveGraphResponse(
+        root=request.root,
+        complete=not failures and not truncated,
+        nodes=dict(sorted(nodes.items())),
+        edges=sorted(edges, key=lambda item: item.relationship_id),
+        failures=sorted(failures, key=lambda item: item.daid),
+        limits=GraphLimits(
+            requested_depth=request.depth,
+            reached_depth=reached_depth,
+            max_nodes=request.max_nodes,
+            truncated=truncated,
+        ),
+        resolved_at=datetime.now(timezone.utc),
     )
 
 
-def _utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)

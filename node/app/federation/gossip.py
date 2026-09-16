@@ -8,7 +8,7 @@ Every GOSSIP_INTERVAL seconds the node:
 
   1. Picks a random *alive* peer from its table.
   2. POSTs its full digest (all known peers + their states) to
-     POST {peer}/v1/gossip/sync
+    POST {peer}/v3/gossip/sync
   3. Receives the peer's digest in response.
   4. Merges: for each peer in the received digest, if the remote generation
      is higher than what we know, update our local state.
@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import httpx
 
@@ -81,14 +81,14 @@ async def _try_bootstrap_seeds(seeds: list[str]) -> list[str]:
                 authority = seed_url.removeprefix("https://").removeprefix("http://").rstrip("/")
                 wk = await fetch_well_known(authority, timeout=5)
                 await _upsert_peer(session, GossipPeerState(
-                    node_id=wk.node_id,
-                    endpoint=wk.endpoint,
-                    public_key=wk.public_key,
+                    node_id=wk.authority,
+                    endpoint=wk.endpoints[0],
+                    public_key=wk.verification_methods[0].public_key_base64,
                     status="alive",
                     last_seen=_now(),
                     generation=0,
                 ))
-                logger.info("[gossip] Discovered seed peer: %s @ %s", wk.node_id, wk.endpoint)
+                logger.info("[gossip] Discovered seed peer: %s @ %s", wk.authority, wk.endpoints[0])
             except Exception as exc:
                 logger.debug("[gossip] Seed %s not ready: %s", seed_url, exc)
                 pending.append(seed_url)
@@ -159,7 +159,7 @@ async def _gossip_round() -> None:
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(
-                f"{target.endpoint.rstrip('/')}/v1/gossip/sync",
+                f"{target.endpoint.rstrip('/')}/v3/gossip/sync",
                 json={"digest": my_digest.model_dump(mode="json")},
             )
             if resp.status_code != 200:
@@ -291,7 +291,7 @@ async def _age_peers() -> None:
 
 async def register_direct_contact(node_id: str, endpoint: str, public_key: str | None, generation: int) -> None:
     """
-    Called when a peer contacts us directly (from POST /v1/gossip/sync).
+    Called when a peer contacts us directly through the gossip sync endpoint.
     Direct contact always resets status to 'alive' and updates last_seen.
     """
     async with AsyncSessionLocal() as session:

@@ -2,8 +2,6 @@
 Node configuration loaded from environment variables (or a .env file).
 """
 
-from typing import Optional
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,6 +28,12 @@ class Settings(BaseSettings):
     # Path to the persisted Ed25519 private key (32 bytes, binary).
     PRIVATE_KEY_FILE: str = "./node_private_key.bin"
 
+    # Local content-addressed storage for uploaded and replicated documents.
+    DOCUMENT_STORAGE_DIR: str = "./data/documents"
+
+    # Maximum accepted document size in bytes (25 MiB by default).
+    MAX_DOCUMENT_BYTES: int = 25 * 1024 * 1024
+
     # ------------------------------------------------------------------
     # Auth
     # ------------------------------------------------------------------
@@ -42,6 +46,9 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Timeout in seconds for outbound federation HTTP calls.
     FEDERATION_TIMEOUT: int = 10
+
+    # Permit HTTP discovery for non-loopback routing hosts in development networks.
+    ALLOW_INSECURE_HTTP_DISCOVERY: bool = False
 
     # How long (seconds) to honour a cached remote record before considering
     # it stale. Set to 0 to always re-fetch from the authority.
@@ -63,13 +70,22 @@ class Settings(BaseSettings):
     # Seconds after being suspected before marking as 'dead'
     GOSSIP_DEAD_TIMEOUT: int = 120
 
-    # Node role: 'producer' (serve own records only) or 'resolver' (also cache + gossip)
+    # Node role for startup behavior and capability defaults.
+    # Supported values:
+    # - producer
+    # - resolver
+    # - manufacturer
+    # - supplier
+    # - contractor
+    # - client
+    # - validator
+    # - relay
     NODE_ROLE: str = "resolver"
 
     # ------------------------------------------------------------------
-    # Optional: Redis (for future pub/sub federation)
+    # DID (did:web)
     # ------------------------------------------------------------------
-    REDIS_URL: Optional[str] = None
+    DID_WEB_ID: str = ""
 
 
 settings = Settings()

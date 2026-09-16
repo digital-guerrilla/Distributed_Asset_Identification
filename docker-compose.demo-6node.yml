@@ -1,0 +1,110 @@
+services:
+  node-manufacturer:
+    build: ./node
+    ports:
+      - "8101:8000"
+    environment:
+      NODE_DOMAIN: "node-manufacturer:8000"
+      NODE_API_BASE: "http://node-manufacturer:8000"
+      DATABASE_URL: "sqlite+aiosqlite:////data/daid.db"
+      PRIVATE_KEY_FILE: "/data/node_key.bin"
+      API_KEY: "manufacturer-key"
+      NODE_ROLE: "manufacturer"
+      ALLOW_INSECURE_HTTP_DISCOVERY: "true"
+      GOSSIP_SEEDS: "http://node-supplier:8000,http://node-contractor:8000,http://node-owner:8000,http://node-inspector:8000,http://node-relay:8000"
+      DID_WEB_ID: "did:web:node-manufacturer%3A8000"
+    volumes:
+      - demo_manufacturer_data:/data
+
+  node-supplier:
+    build: ./node
+    ports:
+      - "8102:8000"
+    environment:
+      NODE_DOMAIN: "node-supplier:8000"
+      NODE_API_BASE: "http://node-supplier:8000"
+      DATABASE_URL: "sqlite+aiosqlite:////data/daid.db"
+      PRIVATE_KEY_FILE: "/data/node_key.bin"
+      API_KEY: "supplier-key"
+      NODE_ROLE: "supplier"
+      ALLOW_INSECURE_HTTP_DISCOVERY: "true"
+      GOSSIP_SEEDS: "http://node-manufacturer:8000,http://node-contractor:8000,http://node-owner:8000,http://node-inspector:8000,http://node-relay:8000"
+      DID_WEB_ID: "did:web:node-supplier%3A8000"
+    volumes:
+      - demo_supplier_data:/data
+
+  node-contractor:
+    build: ./node
+    ports:
+      - "8103:8000"
+    environment:
+      NODE_DOMAIN: "node-contractor:8000"
+      NODE_API_BASE: "http://node-contractor:8000"
+      DATABASE_URL: "sqlite+aiosqlite:////data/daid.db"
+      PRIVATE_KEY_FILE: "/data/node_key.bin"
+      API_KEY: "contractor-key"
+      NODE_ROLE: "main_contractor"
+      ALLOW_INSECURE_HTTP_DISCOVERY: "true"
+      GOSSIP_SEEDS: "http://node-manufacturer:8000,http://node-supplier:8000,http://node-owner:8000,http://node-inspector:8000,http://node-relay:8000"
+      DID_WEB_ID: "did:web:node-contractor%3A8000"
+    volumes:
+      - demo_contractor_data:/data
+
+  node-owner:
+    build: ./node
+    ports:
+      - "8104:8000"
+    environment:
+      NODE_DOMAIN: "node-owner:8000"
+      NODE_API_BASE: "http://node-owner:8000"
+      DATABASE_URL: "sqlite+aiosqlite:////data/daid.db"
+      PRIVATE_KEY_FILE: "/data/node_key.bin"
+      API_KEY: "owner-key"
+      NODE_ROLE: "owner"
+      ALLOW_INSECURE_HTTP_DISCOVERY: "true"
+      GOSSIP_SEEDS: "http://node-manufacturer:8000,http://node-supplier:8000,http://node-contractor:8000,http://node-inspector:8000,http://node-relay:8000"
+      DID_WEB_ID: "did:web:node-owner%3A8000"
+    volumes:
+      - demo_owner_data:/data
+
+  node-inspector:
+    build: ./node
+    ports:
+      - "8105:8000"
+    environment:
+      NODE_DOMAIN: "node-inspector:8000"
+      NODE_API_BASE: "http://node-inspector:8000"
+      DATABASE_URL: "sqlite+aiosqlite:////data/daid.db"
+      PRIVATE_KEY_FILE: "/data/node_key.bin"
+      API_KEY: "inspector-key"
+      NODE_ROLE: "inspector"
+      ALLOW_INSECURE_HTTP_DISCOVERY: "true"
+      GOSSIP_SEEDS: "http://node-manufacturer:8000,http://node-supplier:8000,http://node-contractor:8000,http://node-owner:8000,http://node-relay:8000"
+      DID_WEB_ID: "did:web:node-inspector%3A8000"
+    volumes:
+      - demo_inspector_data:/data
+
+  node-relay:
+    build: ./node
+    ports:
+      - "8106:8000"
+    environment:
+      NODE_DOMAIN: "node-relay:8000"
+      NODE_API_BASE: "http://node-relay:8000"
+      DATABASE_URL: "sqlite+aiosqlite:////data/daid.db"
+      PRIVATE_KEY_FILE: "/data/node_key.bin"
+      API_KEY: "relay-key"
+      NODE_ROLE: "relay"
+      ALLOW_INSECURE_HTTP_DISCOVERY: "true"
+      GOSSIP_SEEDS: "http://node-manufacturer:8000,http://node-supplier:8000,http://node-contractor:8000,http://node-owner:8000,http://node-inspector:8000"
+      DID_WEB_ID: "did:web:node-relay%3A8000"
+    volumes:
+      - demo_relay_data:/data
+
+volumes:
+  demo_manufacturer_data:
+  demo_supplier_data:
+  demo_contractor_data:
+  demo_owner_data:
+  demo_inspector_data:
+  demo_relay_data:

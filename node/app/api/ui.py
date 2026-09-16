@@ -1,15 +1,9 @@
-"""
-Web UI endpoints.
-
-  GET /ui/manufacturer  — Manufacturer dashboard (create/edit products, JSON-LD, gossip)
-  GET /ui/client        — Client product lookup (resolve by DAID, browse, inspect)
-  GET /ui               — Redirects to /ui/manufacturer
-"""
+"""DAID v3 operations console."""
 
 import os
 
 from fastapi import APIRouter
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse
 
 router = APIRouter(tags=["ui"])
 
@@ -22,14 +16,14 @@ def _f(name: str) -> str:
 
 @router.get("/ui", include_in_schema=False)
 async def ui_root():
-    return RedirectResponse("/ui/manufacturer")
+    return FileResponse(_f("dashboard.html"), media_type="text/html")
 
 
 @router.get("/ui/manufacturer", include_in_schema=False)
 async def manufacturer_ui():
-    return FileResponse(_f("manufacturer.html"), media_type="text/html")
+    return FileResponse(_f("dashboard.html"), media_type="text/html")
 
 
 @router.get("/ui/client", include_in_schema=False)
 async def client_ui():
-    return FileResponse(_f("client.html"), media_type="text/html")
+    return FileResponse(_f("dashboard.html"), media_type="text/html")

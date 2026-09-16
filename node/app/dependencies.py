@@ -5,6 +5,8 @@ FastAPI dependency providers.
 - API key guard: protects write endpoints.
 """
 
+import secrets
+
 from fastapi import Header, HTTPException
 
 from .config import settings
@@ -29,5 +31,9 @@ def require_api_key(x_api_key: str = Header(default=None)) -> None:
     FastAPI dependency — raises 401 if the x-api-key header is missing or wrong.
     Use as: `_: None = Depends(require_api_key)`
     """
-    if not x_api_key or x_api_key != settings.API_KEY:
+    if not valid_api_key(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def valid_api_key(api_key: str | None) -> bool:
+    return bool(api_key) and secrets.compare_digest(api_key, settings.API_KEY)
