@@ -128,3 +128,30 @@ into an HTTP error. A verified cached child can be returned as
 
 The current implementation uses SQLite per node and local cache records. The
 production controls still required are tracked in [Roadmap](roadmap.md).
+
+## Backend Integration Flows
+
+External systems enter through adapters rather than writing a second record
+format. An owner can import COBie/CSV/JSON component rows through
+`POST /v3/imports/assets`; the importer signs normal owner instance records,
+extracts valid DAIDs from source fields into `subject.linked_daids`, preserves
+source values and row provenance, and supports idempotent replay. Imported
+links are resolved as `import_reference` graph links and remain distinct from
+authority-signed relationships.
+
+Contractor systems can query an authorized installed-asset projection through
+`GET /v3/records/query` and submit bounded relationship proposal batches through
+`POST /v3/relationships/bulk-proposals`. Installation proposals may carry
+additional signed DAID references to manufacturer, supplier, inspection, or
+evidence records. The owner acceptance workflow remains the authority boundary;
+graph resolution exposes the linked records and their provenance without
+copying another authority's facts into the owner record.
+
+Confidential evidence uses the authenticated fragment primitive in
+`node/app/core/content_crypto.py`. A random SecretBox key encrypts each chunk
+with its own nonce, while the manifest commits to every ciphertext and to the
+reconstructed plaintext. A node holding a fragment can verify its digest but
+cannot read it without the document key. This primitive is deliberately
+separate from placement: threshold/quorum coding, recipient key wrapping,
+storage receipts, repair, and authenticated peer transfer must be added before
+it becomes the network's confidential document service.

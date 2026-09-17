@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -71,6 +72,7 @@ async def propose_relationship(
         state=RelationshipState.PROPOSED,
         target_integrity=target_integrity,
         claims=body.claims,
+        references=body.references,
         evidence=body.evidence,
         proofs=[Proof(
             verification_method=f"{controller}#daid-record-signing",
@@ -91,6 +93,47 @@ async def accept_relationship(
     db: AsyncSession = Depends(get_db),
     key_manager: NodeKeyManager = Depends(get_key_manager),
     _: None = Depends(require_api_key),
+) -> AssetRelationship:
+    return await _accept_one(proposal, db, key_manager)
+
+
+class AcceptBatchRequest(BaseModel):
+    # Cascading acceptance: e.g. a contractor's installation proposal plus every
+    # nested component proposal it covers, accepted by the owner in one call.
+    proposals: list[AssetRelationship] = Field(min_length=1)
+
+
+class AcceptBatchError(BaseModel):
+    relationship_id: str
+    detail: str
+
+
+class AcceptBatchResponse(BaseModel):
+    accepted: list[AssetRelationship]
+    errors: list[AcceptBatchError]
+
+
+@router.post("/accept-batch", response_model=AcceptBatchResponse)
+async def accept_relationships_batch(
+    body: AcceptBatchRequest,
+    db: AsyncSession = Depends(get_db),
+    key_manager: NodeKeyManager = Depends(get_key_manager),
+    _: None = Depends(require_api_key),
+) -> AcceptBatchResponse:
+    accepted: list[AssetRelationship] = []
+    errors: list[AcceptBatchError] = []
+    for proposal in body.proposals:
+        try:
+            accepted.append(await _accept_one(proposal, db, key_manager))
+        except HTTPException as exc:
+            errors.append(AcceptBatchError(relationship_id=proposal.relationship_id, detail=str(exc.detail)))
+    return AcceptBatchResponse(accepted=accepted, errors=errors)
+
+
+async def _accept_one(
+    proposal: AssetRelationship,
+    db: AsyncSession,
+    key_manager: NodeKeyManager,
 ) -> AssetRelationship:
     source = parse_daid(proposal.source)
     target = parse_daid(proposal.target)

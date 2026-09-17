@@ -12,6 +12,7 @@ from ..core.guid import parse_daid
 from ..core.models import (
     AssetRecord,
     GraphFailure,
+    GraphReference,
     GraphLimits,
     GraphNode,
     ResolveGraphRequest,
@@ -113,6 +114,7 @@ async def resolve_graph(
     allow_restricted = request.view != "public" and authenticated
     nodes: dict[str, GraphNode] = {}
     edges = []
+    references: list[GraphReference] = []
     failures: list[GraphFailure] = []
     frontier = {request.root}
     scheduled = {request.root}
@@ -151,12 +153,39 @@ async def resolve_graph(
             for edge in sorted(outcome.record.relationships, key=lambda item: item.relationship_id):
                 edges.append(edge)
                 if edge.target in scheduled or depth >= request.depth:
+                    pass
+                elif len(scheduled) >= request.max_nodes:
+                    truncated = True
+                else:
+                    scheduled.add(edge.target)
+                    next_frontier.add(edge.target)
+                for target in edge.references:
+                    references.append(GraphReference(
+                        source=edge.source,
+                        target=target,
+                        relationship_id=edge.relationship_id,
+                        relation_type=edge.relation_type,
+                    ))
+                    if target in scheduled or depth >= request.depth:
+                        continue
+                    if len(scheduled) >= request.max_nodes:
+                        truncated = True
+                        continue
+                    scheduled.add(target)
+                    next_frontier.add(target)
+            for target in outcome.record.subject.linked_daids:
+                references.append(GraphReference(
+                    source=outcome.record.id,
+                    target=target,
+                    provenance="import_reference",
+                ))
+                if target in scheduled or depth >= request.depth:
                     continue
                 if len(scheduled) >= request.max_nodes:
                     truncated = True
                     continue
-                scheduled.add(edge.target)
-                next_frontier.add(edge.target)
+                scheduled.add(target)
+                next_frontier.add(target)
         frontier = next_frontier
 
     if request.root not in nodes:
@@ -169,6 +198,7 @@ async def resolve_graph(
         complete=not failures and not truncated,
         nodes=dict(sorted(nodes.items())),
         edges=sorted(edges, key=lambda item: item.relationship_id),
+        references=sorted(references, key=lambda item: (item.relationship_id, item.target)),
         failures=sorted(failures, key=lambda item: item.daid),
         limits=GraphLimits(
             requested_depth=request.depth,

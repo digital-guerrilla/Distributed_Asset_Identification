@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -23,8 +24,8 @@ from ..core.models import (
     AvailabilityPolicy,
     Proof,
 )
-from ..db.database import get_db
-from ..db.orm_models import Asset, AssetHistory
+from ..db.database import AsyncSessionLocal, get_db
+from ..db.orm_models import Asset, AssetHistory, ReplicationJob
 from ..dependencies import get_key_manager, require_api_key, valid_api_key
 
 router = APIRouter(prefix="/v3/records", tags=["records"])
@@ -266,13 +267,37 @@ async def _push_to_peers(record: AssetRecord) -> None:
         endpoints = replication_endpoints(record.availability, peers)
         async with httpx.AsyncClient(timeout=5) as client:
             for endpoint in endpoints:
+                job_id = str(uuid.uuid4())
+                now = datetime.now(timezone.utc)
+                async with AsyncSessionLocal() as session:
+                    session.add(ReplicationJob(
+                        job_id=job_id,
+                        record_id=record.id,
+                        endpoint=endpoint,
+                        status="pending",
+                        created_at=now,
+                        updated_at=now,
+                    ))
+                    await session.commit()
                 try:
-                    await client.post(
+                    response = await client.post(
                         f"{endpoint}/v3/federation/sync",
                         json=record.model_dump(mode="json"),
                     )
-                except Exception:
-                    continue
+                    response.raise_for_status()
+                    status = "succeeded"
+                    error = None
+                except Exception as exc:
+                    status = "failed"
+                    error = str(exc)
+                async with AsyncSessionLocal() as session:
+                    job = await session.get(ReplicationJob, job_id)
+                    if job is not None:
+                        job.status = status
+                        job.attempts = 1
+                        job.last_error = error
+                        job.updated_at = datetime.now(timezone.utc)
+                        await session.commit()
     except Exception:
         return
 

@@ -33,6 +33,7 @@ class RelationshipRole(str, Enum):
 
 class RelationshipType(str, Enum):
     DEFINES_TYPE = "defines_type"
+    INSTALLED_BY = "installed_by"
     CUSTODY_EVENT = "custody_event"
     PROCURED_UNDER = "procured_under"
     COMMISSIONED_BY = "commissioned_by"
@@ -80,7 +81,13 @@ class AssetSubject(BaseModel):
     asset_owner: str | None = None
     site: Site | None = None
     documents: list[DocumentRef] = Field(default_factory=list)
+    linked_daids: list[str] = Field(default_factory=list)
     attributes: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("linked_daids")
+    @classmethod
+    def validate_linked_daids(cls, values: list[str]) -> list[str]:
+        return [parse_daid(value).full_id for value in values]
 
 
 class AvailabilityPolicy(BaseModel):
@@ -129,6 +136,7 @@ class AssetRelationship(BaseModel):
         default_factory=lambda: TargetIntegrity(mode="latest", version=None, sha256=None)
     )
     claims: dict[str, Any] = Field(default_factory=dict)
+    references: list[str] = Field(default_factory=list)
     evidence: list[DocumentRef] = Field(default_factory=list)
     proofs: list[Proof] = Field(min_length=1)
 
@@ -138,6 +146,11 @@ class AssetRelationship(BaseModel):
         if not is_valid_daid(value):
             raise ValueError(f"Invalid DAID URI: {value!r}")
         return value
+
+    @field_validator("references")
+    @classmethod
+    def validate_references(cls, values: list[str]) -> list[str]:
+        return [parse_daid(value).full_id for value in values]
 
 
 class RelationshipProposalRequest(BaseModel):
@@ -149,6 +162,7 @@ class RelationshipProposalRequest(BaseModel):
         default_factory=lambda: TargetIntegrity(mode="latest", version=None, sha256=None)
     )
     claims: dict[str, Any] = Field(default_factory=dict)
+    references: list[str] = Field(default_factory=list)
     evidence: list[DocumentRef] = Field(default_factory=list)
     effective_from: datetime | None = None
     effective_to: datetime | None = None
@@ -157,6 +171,17 @@ class RelationshipProposalRequest(BaseModel):
     @classmethod
     def validate_daid(cls, value: str) -> str:
         return parse_daid(value).full_id
+
+    @field_validator("references")
+    @classmethod
+    def validate_references(cls, values: list[str]) -> list[str]:
+        return [parse_daid(value).full_id for value in values]
+
+
+class RelationshipTransitionRequest(BaseModel):
+    new_state: RelationshipState
+    reason: str = Field(min_length=1, max_length=2000)
+    evidence: list[DocumentRef] = Field(default_factory=list)
 
 
 class AssetRecord(BaseModel):
@@ -249,6 +274,8 @@ class NodeInfo(BaseModel):
     protocol_version: Literal["3.0"] = SCHEMA_VERSION
     supported_record_kinds: list[RecordKind] = Field(default_factory=lambda: list(RecordKind))
     role: str
+    encrypted_storage_opt_in: bool = False
+    encrypted_storage_capacity_bytes: int = Field(0, ge=0)
 
 
 class ResolveResponse(BaseModel):
@@ -279,6 +306,14 @@ class GraphNode(BaseModel):
     verified_at: datetime
 
 
+class GraphReference(BaseModel):
+    source: str
+    target: str
+    relationship_id: str | None = None
+    relation_type: RelationshipType | None = None
+    provenance: Literal["relationship_reference", "import_reference"] = "relationship_reference"
+
+
 class GraphFailure(BaseModel):
     daid: str
     status: Literal[
@@ -302,6 +337,7 @@ class ResolveGraphResponse(BaseModel):
     complete: bool
     nodes: dict[str, GraphNode]
     edges: list[AssetRelationship]
+    references: list[GraphReference]
     failures: list[GraphFailure]
     limits: GraphLimits
     resolved_at: datetime
@@ -312,6 +348,25 @@ class AssetListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class BulkRelationshipProposalRequest(BaseModel):
+    proposals: list[RelationshipProposalRequest] = Field(min_length=1, max_length=500)
+
+
+class BulkRelationshipProposalResult(BaseModel):
+    index: int
+    status: Literal["proposed", "failed"]
+    relationship: AssetRelationship | None = None
+    error: str | None = None
+
+
+class BulkRelationshipProposalResponse(BaseModel):
+    batch_id: str
+    total: int
+    proposed: int
+    failed: int
+    results: list[BulkRelationshipProposalResult]
 
 
 class GossipPeerState(BaseModel):

@@ -48,3 +48,27 @@ class GossipPeer(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="alive")
     generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ImportJob(Base):
+    __tablename__ = "import_jobs"
+
+    import_id: Mapped[str] = mapped_column(String, primary_key=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String, unique=True, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ReplicationJob(Base):
+    __tablename__ = "replication_jobs"
+
+    job_id: Mapped[str] = mapped_column(String, primary_key=True)
+    record_id: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    endpoint: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

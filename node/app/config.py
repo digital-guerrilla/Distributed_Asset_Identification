@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # Maximum accepted document size in bytes (25 MiB by default).
     MAX_DOCUMENT_BYTES: int = 25 * 1024 * 1024
 
+    # Opt-in encrypted fragment storage. Disabled unless explicitly enabled.
+    ENCRYPTED_STORAGE_OPT_IN: bool = False
+    ENCRYPTED_STORAGE_CAPACITY_BYTES: int = 0
+    ENCRYPTED_STORAGE_DEFAULT_RETENTION_SECONDS: int = 0
+
     # ------------------------------------------------------------------
     # Auth
     # ------------------------------------------------------------------

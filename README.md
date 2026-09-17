@@ -20,6 +20,9 @@ the protocol and failure model; it is not yet a production trust service. See
 - Exact manufacturer baseline snapshots for `defines_type` relationships
 - Bounded, cycle-safe graph resolution with verified cache fallback
 - Signed public/restricted visibility and explicit per-node replication grants
+- COBie/CSV/JSON owner asset import with DAID extraction, deduplication, and idempotent replay
+- Authorization-aware asset queries and contractor batch relationship proposals
+- Authenticated encrypted evidence fragments with content-integrity manifests
 - Six role-based demo services, gossip membership, Python SDK, and web console
 
 The normative wire and resolution rules are in the
@@ -96,6 +99,13 @@ encrypt SQLite databases or document files at rest; production deployments
 still require encrypted storage, secret management, authenticated service
 identity, key rotation, and transport-layer access controls.
 
+The encrypted fragment primitive in `node/app/core/content_crypto.py` is the
+foundation for confidential evidence. It encrypts each chunk with an
+authenticated nonce and produces a manifest committing to every ciphertext and
+the reconstructed plaintext. The existing document endpoint still stores
+public documents as complete files; quorum placement, recipient key wrapping,
+and authenticated cross-node fragment transfer remain to be integrated.
+
 To retain demo keys and databases between starts:
 
 ```powershell
@@ -162,18 +172,28 @@ Invoke-RestMethod -Method Post -Uri "http://localhost:8000/v3/resolve-graph" `
 | `GET` | `/.well-known/daid/server` | Signed authority descriptor |
 | `GET` | `/v3/node/info` | Node role and authority identity |
 | `GET` | `/v3/node/access` | Validate local private-data access |
+| `GET` | `/v3/node/storage` | Inspect encrypted storage opt-in and capacity |
 | `GET` | `/v3/records` | List locally held records |
+| `GET` | `/v3/records/query` | Query authorized installed assets by identity and location |
 | `POST` | `/v3/records` | Publish an authoritative record |
+| `POST` | `/v3/imports/assets` | Import COBie/CSV/JSON asset rows |
+| `GET` | `/v3/imports/{import_id}` | Read import status and result |
 | `GET` | `/v3/records/{authority}/{uuid}` | Fetch a local record |
 | `PUT` | `/v3/records/{authority}/{uuid}` | Append a signed record version |
 | `GET` | `/v3/records/{authority}/{uuid}/history` | Read immutable prior versions |
 | `POST` | `/v3/relationships/proposals` | Stakeholder-sign a relationship |
+| `POST` | `/v3/relationships/bulk-proposals` | Submit bounded contractor/supplier proposal batches |
 | `POST` | `/v3/relationships/accept` | Verify and owner-accept a proposal |
 | `POST` | `/v3/resolve-graph` | Resolve a bounded verified graph |
 | `POST` | `/v3/federation/sync` | Replicate a verified signed record |
 | `POST` | `/v3/documents/upload/{authority}/{uuid}` | Attach and distribute a document |
+| `POST` | `/v3/documents/encrypted-upload/{authority}/{uuid}` | Attach an encrypted fragment document |
 | `GET` | `/v3/documents/{sha256}` | Read an authorized document replica |
+| `GET` | `/v3/documents/encrypted/{sha256}` | Reconstruct an authorized encrypted document |
+| `POST` | `/v3/documents/encrypted-cleanup` | Remove expired encrypted fragments |
 | `GET` | `/v3/gossip/peers` | Inspect peer membership |
+| `GET` | `/v3/replication/status/{authority}/{uuid}` | Inspect persisted federation delivery jobs |
+| `POST` | `/v3/replication/retry/{authority}/{uuid}` | Requeue authoritative record replication |
 
 Writes require the node's `x-api-key`. Proof verification never treats that API
 key as an identity credential; authority derives from Ed25519 keys and signed
